@@ -16,7 +16,7 @@ export default {
 
             // ここでバックエンドストレージとの接続処理を実装
             // 例: R2, KV, または外部ストレージへのプロキシ
-            
+
             if (method === "PUT" || method === "POST") {
                 // ストリーミングアップロード処理
                 // await uploadToBackend(request.body, url.pathname);
@@ -27,7 +27,8 @@ export default {
                 // return new Response(stream, { status: 200 });
                 return new Response(`Verified ${method} for ${url.pathname}`, { status: 200 });
             } else if (method === "DELETE") {
-                return new Response(`Verified ${method} for ${url.pathname}`, { status: 204 });
+                // 204 No Content はボディを持てない
+                return new Response(null, { status: 204 });
             }
 
             return new Response("Method not allowed", { status: 405 });
@@ -46,12 +47,13 @@ interface Env {
 }
 
 async function verifySignature(request: Request, env: Env): Promise<boolean> {
+    const start = performance.now();
     const url = new URL(request.url);
     const headers = request.headers;
 
     // Query-based auth (Presigned URL) かどうか判定
     const isQueryAuth = url.searchParams.has("X-Amz-Algorithm");
-    
+
     let algorithm: string;
     if (isQueryAuth) {
         algorithm = url.searchParams.get("X-Amz-Algorithm") ?? "";
@@ -65,12 +67,10 @@ async function verifySignature(request: Request, env: Env): Promise<boolean> {
     }
 
     // 日時情報の取得
-    const datetime = (isQueryAuth 
-        ? url.searchParams.get("X-Amz-Date") 
-        : headers.get("x-amz-date")) ?? "";
-    
+    const datetime = (isQueryAuth ? url.searchParams.get("X-Amz-Date") : headers.get("x-amz-date")) ?? "";
+
     if (!datetime) return false;
-    
+
     const date = datetime.substring(0, 8);
 
     // Canonical Request の生成
@@ -79,12 +79,7 @@ async function verifySignature(request: Request, env: Env): Promise<boolean> {
 
     // String to Sign の生成
     const credentialScope = `${date}/${env.REGION}/s3/aws4_request`;
-    const stringToSign = [
-        "AWS4-HMAC-SHA256",
-        datetime,
-        credentialScope,
-        hashedCanonicalRequest
-    ].join("\n");
+    const stringToSign = ["AWS4-HMAC-SHA256", datetime, credentialScope, hashedCanonicalRequest].join("\n");
 
     // 署名の計算
     const signingKey = await getSigningKey(env.SECRET_KEY, date, env.REGION, "s3");
@@ -101,25 +96,45 @@ async function verifySignature(request: Request, env: Env): Promise<boolean> {
         expectedSignature = match ? match[1] : "";
     }
 
+    // デバッグ用
+    if (signatureHex !== expectedSignature) {
+        console.log("Signature mismatch!");
+        console.log("Canonical Request:", canonicalRequest);
+        console.log("String to Sign:", stringToSign);
+        console.log("Computed:", signatureHex);
+        console.log("Expected:", expectedSignature);
+    }
+
+    const end = performance.now();
+    const cpuUsed = end - start;
+
+    console.debug(`CPU time used: ${cpuUsed}ms`);
+
     return signatureHex === expectedSignature;
 }
 
 async function createCanonicalRequest(request: Request, isQueryAuth: boolean): Promise<string> {
     const url = new URL(request.url);
-    
+
     // HTTPメソッド
     const method = request.method;
-    
+
     // Canonical URI (パス部分)
     const canonicalUri = url.pathname || "/";
-    
+
     // Canonical Query String
+    // AWS署名バージョン4では、パラメータ名の大文字小文字を区別してソート
     const params = Array.from(url.searchParams.entries())
         .filter(([key]) => key !== "X-Amz-Signature") // 署名自体は除外
-        .sort(([a], [b]) => a.localeCompare(b))
+        .sort(([a], [b]) => {
+            // バイナリソート（大文字小文字を区別）
+            if (a < b) return -1;
+            if (a > b) return 1;
+            return 0;
+        })
         .map(([key, val]) => `${encodeRFC3986(key)}=${encodeRFC3986(val)}`)
         .join("&");
-    
+
     // Signed Headers の取得
     let signedHeadersList: string[];
     if (isQueryAuth) {
@@ -129,78 +144,52 @@ async function createCanonicalRequest(request: Request, isQueryAuth: boolean): P
         const match = authHeader.match(/SignedHeaders=([^,\s]+)/);
         signedHeadersList = match ? match[1].split(";") : ["host"];
     }
-    
+
     // Canonical Headers の生成
     const canonicalHeaders = signedHeadersList
-        .map(h => {
+        .map((h) => {
             const headerName = h.toLowerCase();
             let headerValue = "";
-            
+
             if (headerName === "host") {
-                // ホストヘッダーはポート番号を除外 (標準ポートの場合)
-                const host = url.hostname;
+                // ホストヘッダーをそのまま使用（URLのhostnameを使用）
+                headerValue = url.hostname;
+                // 非標準ポートの場合はポート番号を追加
                 const port = url.port;
-                if ((url.protocol === "https:" && port === "443") || 
-                    (url.protocol === "http:" && port === "80") ||
-                    !port) {
-                    headerValue = host;
-                } else {
-                    headerValue = `${host}:${port}`;
+                if (port && !((url.protocol === "https:" && port === "443") || (url.protocol === "http:" && port === "80"))) {
+                    headerValue += `:${port}`;
                 }
             } else {
                 headerValue = request.headers.get(headerName)?.trim() ?? "";
             }
-            
+
             return `${headerName}:${headerValue}\n`;
         })
         .join("");
-    
+
     const signedHeaders = signedHeadersList.join(";");
-    
+
     // Payload Hash
-    const payloadHash = request.headers.get("x-amz-content-sha256") ?? 
-                       (isQueryAuth ? "UNSIGNED-PAYLOAD" : "UNSIGNED-PAYLOAD");
-    
-    return [
-        method,
-        canonicalUri,
-        params,
-        canonicalHeaders,
-        signedHeaders,
-        payloadHash
-    ].join("\n");
+    const payloadHash = request.headers.get("x-amz-content-sha256") ?? (isQueryAuth ? "UNSIGNED-PAYLOAD" : "UNSIGNED-PAYLOAD");
+
+    return [method, canonicalUri, params, canonicalHeaders, signedHeaders, payloadHash].join("\n");
 }
 
 // RFC3986に準拠したURLエンコーディング
 function encodeRFC3986(str: string): string {
-    return encodeURIComponent(str)
-        .replace(/[!'()*]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+    return encodeURIComponent(str).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
 }
 
-async function getSigningKey(
-    secret: string,
-    date: string,
-    region: string,
-    service: string
-): Promise<ArrayBuffer> {
+async function getSigningKey(secret: string, date: string, region: string, service: string): Promise<ArrayBuffer> {
     const kDate = await hmacSha256("AWS4" + secret, date);
     const kRegion = await hmacSha256(kDate, region);
     const kService = await hmacSha256(kRegion, service);
     return await hmacSha256(kService, "aws4_request");
 }
 
-async function hmacSha256(
-    key: string | ArrayBuffer,
-    data: string
-): Promise<ArrayBuffer> {
+async function hmacSha256(key: string | ArrayBuffer, data: string): Promise<ArrayBuffer> {
     const keyData = typeof key === "string" ? new TextEncoder().encode(key) : key;
-    const cryptoKey = await crypto.subtle.importKey(
-        "raw",
-        keyData,
-        { name: "HMAC", hash: "SHA-256" },
-        false,
-        ["sign"]
-    );
+    const cryptoKey = await crypto.subtle.importKey("raw", keyData, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
     return await crypto.subtle.sign("HMAC", cryptoKey, new TextEncoder().encode(data));
 }
 
@@ -211,6 +200,6 @@ async function sha256(data: string): Promise<string> {
 
 function bufToHex(buf: ArrayBuffer): string {
     return Array.from(new Uint8Array(buf))
-        .map(b => b.toString(16).padStart(2, "0"))
+        .map((b) => b.toString(16).padStart(2, "0"))
         .join("");
 }
