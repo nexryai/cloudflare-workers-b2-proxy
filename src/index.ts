@@ -5,7 +5,6 @@
 
 export default {
     async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-        const start = performance.now();
         try {
             const isValid = await verifySignature(request, env);
             if (!isValid) {
@@ -49,39 +48,63 @@ export default {
                     });
                 }
 
-                const fileStream = await streamDownloadFromDrive(accessToken, bucket, objectKey, env);
+                try {
+                    const fileStream = await streamDownloadFromDrive(accessToken, bucket, objectKey, env);
 
-                return new Response(fileStream.body, {
-                    status: 200,
-                    headers: {
-                        "Content-Type": fileStream.contentType,
-                        "Content-Length": fileStream.size.toString(),
-                        ETag: `"${fileStream.id}"`,
-                    },
-                });
+                    return new Response(fileStream.body, {
+                        status: 200,
+                        headers: {
+                            "Content-Type": fileStream.contentType,
+                            "Content-Length": fileStream.size.toString(),
+                            ETag: `"${fileStream.id}"`,
+                        },
+                    });
+                } catch (e) {
+                    const error = e as Error;
+                    if (error.message === "File not found") {
+                        return new Response("NoSuchKey", { status: 404 });
+                    }
+                    throw e;
+                }
             } else if (method === "DELETE") {
                 // ファイル削除
                 if (!objectKey) {
                     return new Response("Object key required", { status: 400 });
                 }
 
-                await deleteFromDrive(accessToken, bucket, objectKey, env);
-                return new Response(null, { status: 204 });
+                try {
+                    await deleteFromDrive(accessToken, bucket, objectKey, env);
+                    return new Response(null, { status: 204 });
+                } catch (e) {
+                    const error = e as Error;
+                    if (error.message === "File not found") {
+                        return new Response(null, { status: 404 });
+                    }
+                    throw e;
+                }
             } else if (method === "HEAD") {
                 // メタデータ取得
                 if (!objectKey) {
                     return new Response(null, { status: 400 });
                 }
 
-                const metadata = await getFileMetadata(accessToken, bucket, objectKey, env);
-                return new Response(null, {
-                    status: 200,
-                    headers: {
-                        "Content-Type": metadata.mimeType,
-                        "Content-Length": metadata.size.toString(),
-                        ETag: `"${metadata.id}"`,
-                    },
-                });
+                try {
+                    const metadata = await getFileMetadata(accessToken, bucket, objectKey, env);
+                    return new Response(null, {
+                        status: 200,
+                        headers: {
+                            "Content-Type": metadata.mimeType,
+                            "Content-Length": metadata.size.toString(),
+                            ETag: `"${metadata.id}"`,
+                        },
+                    });
+                } catch (e) {
+                    const error = e as Error;
+                    if (error.message === "File not found") {
+                        return new Response(null, { status: 404 });
+                    }
+                    throw e;
+                }
             }
 
             return new Response("Method not allowed", { status: 405 });
@@ -89,11 +112,6 @@ export default {
             const error = e as Error;
             console.error("Error:", error);
             return new Response(error.message, { status: 500 });
-        } finally {
-            const end = performance.now();
-            const cpuUsed = end - start;
-
-            console.log(`CPU time used: ${cpuUsed}ms`);
         }
     },
 } satisfies ExportedHandler<Env>;
@@ -106,7 +124,19 @@ interface Env {
     GOOGLE_CLIENT_SECRET: string;
     GOOGLE_REFRESH_TOKEN: string;
     AUTH_KV: KVNamespace;
-    FOLDER_CACHE: KVNamespace; // バケット名→フォルダIDのキャッシュ
+    FOLDER_CACHE: KVNamespace;
+}
+
+interface GoogleDriveFile {
+    id: string;
+    name: string;
+    mimeType: string;
+    size: string;
+    modifiedTime?: string;
+}
+
+interface GoogleDriveSearchResponse {
+    files?: GoogleDriveFile[];
 }
 
 // ========================================
@@ -132,7 +162,7 @@ async function getAccessToken(env: Env): Promise<string> {
         }),
     });
 
-    const data = await response.json();
+    const data: any = await response.json();
     if (!response.ok) {
         throw new Error(`Token Error: ${data.error_description}`);
     }
@@ -154,7 +184,7 @@ async function getOrCreateFolder(accessToken: string, folderName: string, env: E
         headers: { Authorization: `Bearer ${accessToken}` },
     });
 
-    const searchData = await searchRes.json();
+    const searchData: GoogleDriveSearchResponse = await searchRes.json();
 
     if (searchData.files && searchData.files.length > 0) {
         const folderId = searchData.files[0].id;
@@ -175,7 +205,7 @@ async function getOrCreateFolder(accessToken: string, folderName: string, env: E
         }),
     });
 
-    const createData = await createRes.json();
+    const createData: any = await createRes.json();
     await env.FOLDER_CACHE.put(folderName, createData.id, { expirationTtl: 3600 });
     return createData.id;
 }
@@ -214,8 +244,8 @@ async function streamUploadToDrive(accessToken: string, stream: ReadableStream |
             Authorization: `Bearer ${accessToken}`,
         },
         body: stream,
-        duplex: "half" as any,
-    });
+        duplex: "half",
+    } as RequestInit);
 
     if (!uploadRes.ok) {
         const errorText = await uploadRes.text();
@@ -225,12 +255,12 @@ async function streamUploadToDrive(accessToken: string, stream: ReadableStream |
     return await uploadRes.json();
 }
 
-async function findFileInFolder(accessToken: string, folderId: string, fileName: string): Promise<any> {
+async function findFileInFolder(accessToken: string, folderId: string, fileName: string): Promise<GoogleDriveFile | null> {
     const searchRes = await fetch(`https://www.googleapis.com/drive/v3/files?q=name='${encodeURIComponent(fileName)}' and '${folderId}' in parents and trashed=false&fields=files(id,name,mimeType,size)`, {
         headers: { Authorization: `Bearer ${accessToken}` },
     });
 
-    const data = await searchRes.json();
+    const data: GoogleDriveSearchResponse = await searchRes.json();
     return data.files && data.files.length > 0 ? data.files[0] : null;
 }
 
@@ -291,14 +321,14 @@ async function getFileMetadata(accessToken: string, bucket: string, objectKey: s
     };
 }
 
-async function listFiles(accessToken: string, bucket: string, env: Env): Promise<any[]> {
+async function listFiles(accessToken: string, bucket: string, env: Env): Promise<GoogleDriveFile[]> {
     const folderId = await getOrCreateFolder(accessToken, bucket, env);
 
     const listRes = await fetch(`https://www.googleapis.com/drive/v3/files?q='${folderId}' in parents and trashed=false&fields=files(id,name,mimeType,size,modifiedTime)`, {
         headers: { Authorization: `Bearer ${accessToken}` },
     });
 
-    const data = await listRes.json();
+    const data: GoogleDriveSearchResponse = await listRes.json();
     return data.files || [];
 }
 

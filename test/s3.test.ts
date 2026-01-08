@@ -263,18 +263,41 @@ describe("S3 API Server with Google Drive Backend", () => {
         });
 
         // ファイル一覧を返すようにモックを更新
-        (global.fetch as any).mockImplementationOnce(async (url: string) => {
-            if (url.includes("drive/v3/files") && url.includes("in parents")) {
+        const originalFetch = global.fetch;
+        (global.fetch as any) = vi.fn(async (url: string, init?: any) => {
+            const urlStr = typeof url === "string" ? url : url.toString();
+
+            if (urlStr.includes("oauth2.googleapis.com/token")) {
+                return new Response(
+                    JSON.stringify({
+                        access_token: "mock-access-token",
+                        expires_in: 3600,
+                    }),
+                    { status: 200 },
+                );
+            }
+
+            if (urlStr.includes("drive/v3/files") && urlStr.includes("mimeType='application/vnd.google-apps.folder'")) {
+                return new Response(
+                    JSON.stringify({
+                        files: [{ id: "folder-id-123", name: "test-bucket" }],
+                    }),
+                    { status: 200 },
+                );
+            }
+
+            if (urlStr.includes("drive/v3/files") && urlStr.includes("in parents")) {
                 return new Response(
                     JSON.stringify({
                         files: [
-                            { id: "1", name: "file1.txt", size: "100", modifiedTime: "2024-01-01T00:00:00Z" },
-                            { id: "2", name: "file2.txt", size: "200", modifiedTime: "2024-01-02T00:00:00Z" },
+                            { id: "1", name: "file1.txt", size: "100", mimeType: "text/plain", modifiedTime: "2024-01-01T00:00:00Z" },
+                            { id: "2", name: "file2.txt", size: "200", mimeType: "text/plain", modifiedTime: "2024-01-02T00:00:00Z" },
                         ],
                     }),
                     { status: 200 },
                 );
             }
+
             return new Response("Not Found", { status: 404 });
         });
 
@@ -293,5 +316,226 @@ describe("S3 API Server with Google Drive Backend", () => {
         expect(xmlText).toContain("<ListBucketResult");
         expect(xmlText).toContain("file1.txt");
         expect(xmlText).toContain("file2.txt");
+
+        global.fetch = originalFetch;
+    });
+
+    // 8. 存在しないファイルのHEADリクエスト (404)
+    it("should return 404 for HEAD on non-existent file", async () => {
+        const aws4 = new AwsClient({
+            accessKeyId: ENV.ACCESS_KEY,
+            secretAccessKey: ENV.SECRET_KEY,
+            region: ENV.REGION,
+            service: "s3",
+        });
+
+        // ファイルが見つからないケース
+        const originalFetch = global.fetch;
+        (global.fetch as any) = vi.fn(async (url: string, init?: any) => {
+            const urlStr = typeof url === "string" ? url : url.toString();
+
+            if (urlStr.includes("oauth2.googleapis.com/token")) {
+                return new Response(
+                    JSON.stringify({
+                        access_token: "mock-access-token",
+                        expires_in: 3600,
+                    }),
+                    { status: 200 },
+                );
+            }
+
+            if (urlStr.includes("drive/v3/files") && urlStr.includes("mimeType='application/vnd.google-apps.folder'")) {
+                return new Response(
+                    JSON.stringify({
+                        files: [{ id: "folder-id-123", name: "test-bucket" }],
+                    }),
+                    { status: 200 },
+                );
+            }
+
+            if (urlStr.includes("drive/v3/files") && urlStr.includes("in parents")) {
+                // ファイルが存在しない
+                return new Response(JSON.stringify({ files: [] }), { status: 200 });
+            }
+
+            return new Response("Not Found", { status: 404 });
+        });
+
+        const requestUrl = `${endpoint}/test-bucket/non-existent.txt`;
+        const signedReq = await aws4.sign(requestUrl, {
+            method: "HEAD",
+            headers: {
+                "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
+            },
+        });
+
+        const response = await worker.fetch(signedReq, ENV, CTX);
+        expect(response.status).toBe(404);
+
+        global.fetch = originalFetch;
+    });
+
+    // 9. 存在しないファイルのGETリクエスト (404)
+    it("should return 404 for GET on non-existent file", async () => {
+        const aws4 = new AwsClient({
+            accessKeyId: ENV.ACCESS_KEY,
+            secretAccessKey: ENV.SECRET_KEY,
+            region: ENV.REGION,
+            service: "s3",
+        });
+
+        const originalFetch = global.fetch;
+        (global.fetch as any) = vi.fn(async (url: string, init?: any) => {
+            const urlStr = typeof url === "string" ? url : url.toString();
+
+            if (urlStr.includes("oauth2.googleapis.com/token")) {
+                return new Response(
+                    JSON.stringify({
+                        access_token: "mock-access-token",
+                        expires_in: 3600,
+                    }),
+                    { status: 200 },
+                );
+            }
+
+            if (urlStr.includes("drive/v3/files") && urlStr.includes("mimeType='application/vnd.google-apps.folder'")) {
+                return new Response(
+                    JSON.stringify({
+                        files: [{ id: "folder-id-123", name: "test-bucket" }],
+                    }),
+                    { status: 200 },
+                );
+            }
+
+            if (urlStr.includes("drive/v3/files") && urlStr.includes("in parents")) {
+                return new Response(JSON.stringify({ files: [] }), { status: 200 });
+            }
+
+            return new Response("Not Found", { status: 404 });
+        });
+
+        const requestUrl = `${endpoint}/test-bucket/non-existent.txt`;
+        const signedReq = await aws4.sign(requestUrl, {
+            method: "GET",
+            headers: {
+                "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
+            },
+        });
+
+        const response = await worker.fetch(signedReq, ENV, CTX);
+        expect(response.status).toBe(404);
+        expect(await response.text()).toBe("NoSuchKey");
+
+        global.fetch = originalFetch;
+    });
+
+    // 10. 存在しないファイルのDELETEリクエスト (404)
+    it("should return 404 for DELETE on non-existent file", async () => {
+        const aws4 = new AwsClient({
+            accessKeyId: ENV.ACCESS_KEY,
+            secretAccessKey: ENV.SECRET_KEY,
+            region: ENV.REGION,
+            service: "s3",
+        });
+
+        const originalFetch = global.fetch;
+        (global.fetch as any) = vi.fn(async (url: string, init?: any) => {
+            const urlStr = typeof url === "string" ? url : url.toString();
+
+            if (urlStr.includes("oauth2.googleapis.com/token")) {
+                return new Response(
+                    JSON.stringify({
+                        access_token: "mock-access-token",
+                        expires_in: 3600,
+                    }),
+                    { status: 200 },
+                );
+            }
+
+            if (urlStr.includes("drive/v3/files") && urlStr.includes("mimeType='application/vnd.google-apps.folder'")) {
+                return new Response(
+                    JSON.stringify({
+                        files: [{ id: "folder-id-123", name: "test-bucket" }],
+                    }),
+                    { status: 200 },
+                );
+            }
+
+            if (urlStr.includes("drive/v3/files") && urlStr.includes("in parents")) {
+                return new Response(JSON.stringify({ files: [] }), { status: 200 });
+            }
+
+            return new Response("Not Found", { status: 404 });
+        });
+
+        const requestUrl = `${endpoint}/test-bucket/non-existent.txt`;
+        const signedReq = await aws4.sign(requestUrl, {
+            method: "DELETE",
+            headers: {
+                "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
+            },
+        });
+
+        const response = await worker.fetch(signedReq, ENV, CTX);
+        expect(response.status).toBe(404);
+
+        global.fetch = originalFetch;
+    });
+
+    // 11. 空のバケット一覧
+    it("should return empty list for empty bucket", async () => {
+        const aws4 = new AwsClient({
+            accessKeyId: ENV.ACCESS_KEY,
+            secretAccessKey: ENV.SECRET_KEY,
+            region: ENV.REGION,
+            service: "s3",
+        });
+
+        const originalFetch = global.fetch;
+        (global.fetch as any) = vi.fn(async (url: string, init?: any) => {
+            const urlStr = typeof url === "string" ? url : url.toString();
+
+            if (urlStr.includes("oauth2.googleapis.com/token")) {
+                return new Response(
+                    JSON.stringify({
+                        access_token: "mock-access-token",
+                        expires_in: 3600,
+                    }),
+                    { status: 200 },
+                );
+            }
+
+            if (urlStr.includes("drive/v3/files") && urlStr.includes("mimeType='application/vnd.google-apps.folder'")) {
+                return new Response(
+                    JSON.stringify({
+                        files: [{ id: "folder-id-123", name: "empty-bucket" }],
+                    }),
+                    { status: 200 },
+                );
+            }
+
+            if (urlStr.includes("drive/v3/files") && urlStr.includes("in parents")) {
+                return new Response(JSON.stringify({ files: [] }), { status: 200 });
+            }
+
+            return new Response("Not Found", { status: 404 });
+        });
+
+        const requestUrl = `${endpoint}/empty-bucket/`;
+        const signedReq = await aws4.sign(requestUrl, {
+            method: "GET",
+            headers: {
+                "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
+            },
+        });
+
+        const response = await worker.fetch(signedReq, ENV, CTX);
+        expect(response.status).toBe(200);
+
+        const xmlText = await response.text();
+        expect(xmlText).toContain("<ListBucketResult");
+        expect(xmlText).not.toContain("<Contents>");
+
+        global.fetch = originalFetch;
     });
 });
