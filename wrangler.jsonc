@@ -4,12 +4,22 @@
  */
 {
     "$schema": "node_modules/wrangler/config-schema.json",
-    "name": "google-drive-s3",
+    "name": "iris",
     "main": "src/index.ts",
     "compatibility_date": "2025-09-27",
     "observability": {
         "enabled": true
-    }
+    },
+    "kv_namespaces": [
+        {
+            "binding": "AUTH_KV",
+            "id": "ba953a1ce2cd41a7ba1d348075d34171"
+        },
+        {
+            "binding": "FOLDER_CACHE",
+            "id": "6332b0674a8342e4b270ca3368d3c52a"
+        }
+    ]
     /**
      * Smart Placement
      * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement

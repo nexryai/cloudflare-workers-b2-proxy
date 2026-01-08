@@ -1,13 +1,19 @@
-import { describe, it, expect, vi } from "vitest";
-import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import { GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { AwsClient } from "aws4fetch";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
 import worker from "../src/index";
 
 const ENV = {
     ACCESS_KEY: "test-access-key",
     SECRET_KEY: "test-secret-key",
     REGION: "auto",
+    GOOGLE_CLIENT_ID: "test-client-id",
+    GOOGLE_CLIENT_SECRET: "test-client-secret",
+    GOOGLE_REFRESH_TOKEN: "test-refresh-token",
+    AUTH_KV: createMockKV(),
+    FOLDER_CACHE: createMockKV(),
 };
 
 const CTX = {
@@ -15,10 +21,105 @@ const CTX = {
     passThroughOnException: vi.fn(),
 };
 
-describe("S3 API Server Authentication", () => {
+function createMockKV() {
+    const storage = new Map<string, string>();
+    return {
+        get: vi.fn(async (key: string) => storage.get(key) || null),
+        put: vi.fn(async (key: string, value: string, options?: any) => {
+            storage.set(key, value);
+        }),
+        delete: vi.fn(async (key: string) => storage.delete(key)),
+        list: vi.fn(async () => ({ keys: [] })),
+    };
+}
+
+// Google API のモック
+global.fetch = vi.fn(async (url: string | URL | Request, init?: any) => {
+    const urlStr = typeof url === "string" ? url : url instanceof URL ? url.toString() : url.url;
+
+    // OAuth トークン取得
+    if (urlStr.includes("oauth2.googleapis.com/token")) {
+        return new Response(
+            JSON.stringify({
+                access_token: "mock-access-token",
+                expires_in: 3600,
+            }),
+            { status: 200 },
+        );
+    }
+
+    // フォルダ検索
+    if (urlStr.includes("drive/v3/files") && urlStr.includes("mimeType='application/vnd.google-apps.folder'")) {
+        return new Response(
+            JSON.stringify({
+                files: [{ id: "folder-id-123", name: "test-bucket" }],
+            }),
+            { status: 200 },
+        );
+    }
+
+    // ファイル検索
+    if (urlStr.includes("drive/v3/files") && urlStr.includes("in parents")) {
+        return new Response(
+            JSON.stringify({
+                files: [
+                    {
+                        id: "file-id-456",
+                        name: "test-file.txt",
+                        mimeType: "text/plain",
+                        size: "11",
+                    },
+                ],
+            }),
+            { status: 200 },
+        );
+    }
+
+    // Resumable upload 初期化
+    if (urlStr.includes("uploadType=resumable") && init?.method === "POST") {
+        return new Response(null, {
+            status: 200,
+            headers: { Location: "https://www.googleapis.com/upload/drive/v3/files/uploadid123" },
+        });
+    }
+
+    // Resumable upload 実行
+    if (urlStr.includes("upload/drive/v3/files/uploadid")) {
+        return new Response(
+            JSON.stringify({
+                id: "new-file-id-789",
+                name: "uploaded-file.txt",
+                mimeType: "text/plain",
+            }),
+            { status: 200 },
+        );
+    }
+
+    // ファイルダウンロード
+    if (urlStr.includes("alt=media")) {
+        return new Response("Hello World", {
+            status: 200,
+            headers: { "Content-Type": "text/plain" },
+        });
+    }
+
+    // ファイル削除
+    if (init?.method === "DELETE") {
+        return new Response(null, { status: 204 });
+    }
+
+    return new Response("Not Found", { status: 404 });
+}) as any;
+
+describe("S3 API Server with Google Drive Backend", () => {
     const endpoint = "https://s3-api.example.com";
 
-    it("should verify requests from aws4fetch (Header Auth)", async () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+    });
+
+    // 1. PUT (Upload) テスト
+    it("should upload file via PUT with Header Auth", async () => {
         const aws4 = new AwsClient({
             accessKeyId: ENV.ACCESS_KEY,
             secretAccessKey: ENV.SECRET_KEY,
@@ -33,14 +134,83 @@ describe("S3 API Server Authentication", () => {
                 "Content-Type": "text/plain",
                 "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
             },
-            body: "hello world",
+            body: "Hello World",
         });
 
         const response = await worker.fetch(signedReq, ENV, CTX);
         expect(response.status).toBe(200);
-        expect(await response.text()).toContain("Verified PUT");
+
+        const result = await response.json();
+        expect(result).toHaveProperty("id");
     });
 
+    // 2. GET (Download) テスト
+    it("should download file via GET with Header Auth", async () => {
+        const aws4 = new AwsClient({
+            accessKeyId: ENV.ACCESS_KEY,
+            secretAccessKey: ENV.SECRET_KEY,
+            region: ENV.REGION,
+            service: "s3",
+        });
+
+        const requestUrl = `${endpoint}/test-bucket/test-file.txt`;
+        const signedReq = await aws4.sign(requestUrl, {
+            method: "GET",
+            headers: {
+                "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
+            },
+        });
+
+        const response = await worker.fetch(signedReq, ENV, CTX);
+        expect(response.status).toBe(200);
+        expect(await response.text()).toBe("Hello World");
+    });
+
+    // 3. DELETE テスト
+    it("should delete file via DELETE", async () => {
+        const aws4 = new AwsClient({
+            accessKeyId: ENV.ACCESS_KEY,
+            secretAccessKey: ENV.SECRET_KEY,
+            region: ENV.REGION,
+            service: "s3",
+        });
+
+        const requestUrl = `${endpoint}/test-bucket/test-file.txt`;
+        const signedReq = await aws4.sign(requestUrl, {
+            method: "DELETE",
+            headers: {
+                "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
+            },
+        });
+
+        const response = await worker.fetch(signedReq, ENV, CTX);
+        expect(response.status).toBe(204);
+    });
+
+    // 4. HEAD (Metadata) テスト
+    it("should get file metadata via HEAD", async () => {
+        const aws4 = new AwsClient({
+            accessKeyId: ENV.ACCESS_KEY,
+            secretAccessKey: ENV.SECRET_KEY,
+            region: ENV.REGION,
+            service: "s3",
+        });
+
+        const requestUrl = `${endpoint}/test-bucket/test-file.txt`;
+        const signedReq = await aws4.sign(requestUrl, {
+            method: "HEAD",
+            headers: {
+                "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
+            },
+        });
+
+        const response = await worker.fetch(signedReq, ENV, CTX);
+        expect(response.status).toBe(200);
+        expect(response.headers.get("Content-Type")).toBe("text/plain");
+        expect(response.headers.get("Content-Length")).toBe("11");
+    });
+
+    // 5. Presigned URL テスト
     it("should verify presigned URLs from @aws-sdk/s3-request-presigner", async () => {
         const s3 = new S3Client({
             region: ENV.REGION,
@@ -56,9 +226,6 @@ describe("S3 API Server Authentication", () => {
         });
 
         const url = await getSignedUrl(s3, command, { expiresIn: 3600 });
-
-        console.log("Presigned URL:", url);
-
         const parsedUrl = new URL(url);
 
         const testUrl = new URL(endpoint);
@@ -70,27 +237,9 @@ describe("S3 API Server Authentication", () => {
         const response = await worker.fetch(request, ENV, CTX);
 
         expect(response.status).toBe(200);
-        expect(await response.text()).toContain("Verified GET");
     });
 
-    it("should verify requests from aws4fetch with query parameters", async () => {
-        const aws4 = new AwsClient({
-            accessKeyId: ENV.ACCESS_KEY,
-            secretAccessKey: ENV.SECRET_KEY,
-            region: ENV.REGION,
-            service: "s3",
-        });
-
-        const requestUrl = `${endpoint}/test-bucket/aws4-fetch-test`;
-        const signedReq = await aws4.sign(requestUrl, {
-            method: "GET",
-            aws: { signQuery: true }, // クエリパラメータ署名
-        });
-
-        const response = await worker.fetch(signedReq, ENV, CTX);
-        expect(response.status).toBe(200);
-    });
-
+    // 6. 不正な署名のテスト
     it("should reject invalid signatures", async () => {
         const request = new Request(`${endpoint}/hack`, {
             method: "GET",
@@ -104,8 +253,8 @@ describe("S3 API Server Authentication", () => {
         expect(response.status).toBe(403);
     });
 
-    // 5. DELETE メソッドのテスト
-    it("should verify DELETE requests", async () => {
+    // 7. バケット一覧テスト (LIST)
+    it("should list files in bucket", async () => {
         const aws4 = new AwsClient({
             accessKeyId: ENV.ACCESS_KEY,
             secretAccessKey: ENV.SECRET_KEY,
@@ -113,15 +262,36 @@ describe("S3 API Server Authentication", () => {
             service: "s3",
         });
 
-        const requestUrl = `${endpoint}/test-bucket/file-to-delete.txt`;
+        // ファイル一覧を返すようにモックを更新
+        (global.fetch as any).mockImplementationOnce(async (url: string) => {
+            if (url.includes("drive/v3/files") && url.includes("in parents")) {
+                return new Response(
+                    JSON.stringify({
+                        files: [
+                            { id: "1", name: "file1.txt", size: "100", modifiedTime: "2024-01-01T00:00:00Z" },
+                            { id: "2", name: "file2.txt", size: "200", modifiedTime: "2024-01-02T00:00:00Z" },
+                        ],
+                    }),
+                    { status: 200 },
+                );
+            }
+            return new Response("Not Found", { status: 404 });
+        });
+
+        const requestUrl = `${endpoint}/test-bucket/`;
         const signedReq = await aws4.sign(requestUrl, {
-            method: "DELETE",
+            method: "GET",
             headers: {
                 "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
             },
         });
 
         const response = await worker.fetch(signedReq, ENV, CTX);
-        expect(response.status).toBe(204);
+        expect(response.status).toBe(200);
+
+        const xmlText = await response.text();
+        expect(xmlText).toContain("<ListBucketResult");
+        expect(xmlText).toContain("file1.txt");
+        expect(xmlText).toContain("file2.txt");
     });
 });

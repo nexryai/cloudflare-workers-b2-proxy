@@ -1,10 +1,11 @@
 /**
  * S3-Compatible API Server on Cloudflare Workers
- * Supports both Header-based and Presigned URL authentication
+ * Backend: Google Drive with streaming support
  */
 
 export default {
     async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+        const start = performance.now();
         try {
             const isValid = await verifySignature(request, env);
             if (!isValid) {
@@ -14,21 +15,73 @@ export default {
             const url = new URL(request.url);
             const method = request.method;
 
-            // ここでバックエンドストレージとの接続処理を実装
-            // 例: R2, KV, または外部ストレージへのプロキシ
+            // パスからバケット名とオブジェクトキーを抽出
+            const pathParts = url.pathname.split("/").filter((p) => p);
+            const bucket = pathParts[0] || "";
+            const objectKey = pathParts.slice(1).join("/");
+
+            const accessToken = await getAccessToken(env);
 
             if (method === "PUT" || method === "POST") {
-                // ストリーミングアップロード処理
-                // await uploadToBackend(request.body, url.pathname);
-                return new Response(`Verified ${method} for ${url.pathname}`, { status: 200 });
+                // ストリーミングアップロード
+                if (!objectKey) {
+                    return new Response("Object key required", { status: 400 });
+                }
+
+                const contentType = request.headers.get("Content-Type") || "application/octet-stream";
+                const result = await streamUploadToDrive(accessToken, request.body, bucket, objectKey, contentType, env);
+
+                return new Response(JSON.stringify(result), {
+                    status: 200,
+                    headers: {
+                        "Content-Type": "application/json",
+                        ETag: `"${result.id}"`, // Google DriveのファイルIDをETagとして使用
+                    },
+                });
             } else if (method === "GET") {
-                // ストリーミングダウンロード処理
-                // const stream = await downloadFromBackend(url.pathname);
-                // return new Response(stream, { status: 200 });
-                return new Response(`Verified ${method} for ${url.pathname}`, { status: 200 });
+                // ストリーミングダウンロード
+                if (!objectKey) {
+                    // バケット（フォルダ）の一覧を返す
+                    const files = await listFiles(accessToken, bucket, env);
+                    return new Response(generateListBucketResult(files, bucket), {
+                        status: 200,
+                        headers: { "Content-Type": "application/xml" },
+                    });
+                }
+
+                const fileStream = await streamDownloadFromDrive(accessToken, bucket, objectKey, env);
+
+                return new Response(fileStream.body, {
+                    status: 200,
+                    headers: {
+                        "Content-Type": fileStream.contentType,
+                        "Content-Length": fileStream.size.toString(),
+                        ETag: `"${fileStream.id}"`,
+                    },
+                });
             } else if (method === "DELETE") {
-                // 204 No Content はボディを持てない
+                // ファイル削除
+                if (!objectKey) {
+                    return new Response("Object key required", { status: 400 });
+                }
+
+                await deleteFromDrive(accessToken, bucket, objectKey, env);
                 return new Response(null, { status: 204 });
+            } else if (method === "HEAD") {
+                // メタデータ取得
+                if (!objectKey) {
+                    return new Response(null, { status: 400 });
+                }
+
+                const metadata = await getFileMetadata(accessToken, bucket, objectKey, env);
+                return new Response(null, {
+                    status: 200,
+                    headers: {
+                        "Content-Type": metadata.mimeType,
+                        "Content-Length": metadata.size.toString(),
+                        ETag: `"${metadata.id}"`,
+                    },
+                });
             }
 
             return new Response("Method not allowed", { status: 405 });
@@ -36,6 +89,11 @@ export default {
             const error = e as Error;
             console.error("Error:", error);
             return new Response(error.message, { status: 500 });
+        } finally {
+            const end = performance.now();
+            const cpuUsed = end - start;
+
+            console.log(`CPU time used: ${cpuUsed}ms`);
         }
     },
 } satisfies ExportedHandler<Env>;
@@ -44,14 +102,242 @@ interface Env {
     ACCESS_KEY: string;
     SECRET_KEY: string;
     REGION: string;
+    GOOGLE_CLIENT_ID: string;
+    GOOGLE_CLIENT_SECRET: string;
+    GOOGLE_REFRESH_TOKEN: string;
+    AUTH_KV: KVNamespace;
+    FOLDER_CACHE: KVNamespace; // バケット名→フォルダIDのキャッシュ
 }
 
+// ========================================
+// Google Drive API Functions
+// ========================================
+
+async function getAccessToken(env: Env): Promise<string> {
+    const cacheKey = "google_access_token";
+
+    const cachedToken = await env.AUTH_KV.get(cacheKey);
+    if (cachedToken) {
+        return cachedToken;
+    }
+
+    const response = await fetch("https://oauth2.googleapis.com/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+            client_id: env.GOOGLE_CLIENT_ID,
+            client_secret: env.GOOGLE_CLIENT_SECRET,
+            refresh_token: env.GOOGLE_REFRESH_TOKEN,
+            grant_type: "refresh_token",
+        }),
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+        throw new Error(`Token Error: ${data.error_description}`);
+    }
+
+    await env.AUTH_KV.put(cacheKey, data.access_token, {
+        expirationTtl: data.expires_in - 60,
+    });
+
+    return data.access_token;
+}
+
+async function getOrCreateFolder(accessToken: string, folderName: string, env: Env): Promise<string> {
+    // キャッシュを確認
+    const cached = await env.FOLDER_CACHE.get(folderName);
+    if (cached) return cached;
+
+    // フォルダを検索
+    const searchRes = await fetch(`https://www.googleapis.com/drive/v3/files?q=name='${encodeURIComponent(folderName)}' and mimeType='application/vnd.google-apps.folder' and trashed=false`, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+    });
+
+    const searchData = await searchRes.json();
+
+    if (searchData.files && searchData.files.length > 0) {
+        const folderId = searchData.files[0].id;
+        await env.FOLDER_CACHE.put(folderName, folderId, { expirationTtl: 3600 });
+        return folderId;
+    }
+
+    // フォルダが存在しない場合は作成
+    const createRes = await fetch("https://www.googleapis.com/drive/v3/files", {
+        method: "POST",
+        headers: {
+            Authorization: `Bearer ${accessToken}`,
+            "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+            name: folderName,
+            mimeType: "application/vnd.google-apps.folder",
+        }),
+    });
+
+    const createData = await createRes.json();
+    await env.FOLDER_CACHE.put(folderName, createData.id, { expirationTtl: 3600 });
+    return createData.id;
+}
+
+async function streamUploadToDrive(accessToken: string, stream: ReadableStream | null, bucket: string, objectKey: string, mimeType: string, env: Env): Promise<any> {
+    if (!stream) {
+        throw new Error("Request body is required");
+    }
+
+    // バケット名に対応するフォルダIDを取得
+    const folderId = await getOrCreateFolder(accessToken, bucket, env);
+
+    // Resumable uploadの初期化
+    const initRes = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable", {
+        method: "POST",
+        headers: {
+            Authorization: `Bearer ${accessToken}`,
+            "X-Upload-Content-Type": mimeType,
+            "Content-Type": "application/json; charset=UTF-8",
+        },
+        body: JSON.stringify({
+            name: objectKey,
+            parents: [folderId],
+        }),
+    });
+
+    const uploadUrl = initRes.headers.get("Location");
+    if (!uploadUrl) {
+        throw new Error("Failed to get upload URL");
+    }
+
+    // ストリーミングアップロード
+    const uploadRes = await fetch(uploadUrl, {
+        method: "PUT",
+        headers: {
+            Authorization: `Bearer ${accessToken}`,
+        },
+        body: stream,
+        duplex: "half" as any,
+    });
+
+    if (!uploadRes.ok) {
+        const errorText = await uploadRes.text();
+        throw new Error(`Upload failed: ${errorText}`);
+    }
+
+    return await uploadRes.json();
+}
+
+async function findFileInFolder(accessToken: string, folderId: string, fileName: string): Promise<any> {
+    const searchRes = await fetch(`https://www.googleapis.com/drive/v3/files?q=name='${encodeURIComponent(fileName)}' and '${folderId}' in parents and trashed=false&fields=files(id,name,mimeType,size)`, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+    });
+
+    const data = await searchRes.json();
+    return data.files && data.files.length > 0 ? data.files[0] : null;
+}
+
+async function streamDownloadFromDrive(accessToken: string, bucket: string, objectKey: string, env: Env): Promise<{ body: ReadableStream; contentType: string; size: number; id: string }> {
+    const folderId = await getOrCreateFolder(accessToken, bucket, env);
+    const file = await findFileInFolder(accessToken, folderId, objectKey);
+
+    if (!file) {
+        throw new Error("File not found");
+    }
+
+    const downloadRes = await fetch(`https://www.googleapis.com/drive/v3/files/${file.id}?alt=media`, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+    });
+
+    if (!downloadRes.ok) {
+        throw new Error("Download failed");
+    }
+
+    return {
+        body: downloadRes.body!,
+        contentType: file.mimeType || "application/octet-stream",
+        size: parseInt(file.size || "0"),
+        id: file.id,
+    };
+}
+
+async function deleteFromDrive(accessToken: string, bucket: string, objectKey: string, env: Env): Promise<void> {
+    const folderId = await getOrCreateFolder(accessToken, bucket, env);
+    const file = await findFileInFolder(accessToken, folderId, objectKey);
+
+    if (!file) {
+        throw new Error("File not found");
+    }
+
+    const deleteRes = await fetch(`https://www.googleapis.com/drive/v3/files/${file.id}`, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${accessToken}` },
+    });
+
+    if (!deleteRes.ok) {
+        throw new Error("Delete failed");
+    }
+}
+
+async function getFileMetadata(accessToken: string, bucket: string, objectKey: string, env: Env): Promise<{ id: string; mimeType: string; size: number }> {
+    const folderId = await getOrCreateFolder(accessToken, bucket, env);
+    const file = await findFileInFolder(accessToken, folderId, objectKey);
+
+    if (!file) {
+        throw new Error("File not found");
+    }
+
+    return {
+        id: file.id,
+        mimeType: file.mimeType || "application/octet-stream",
+        size: parseInt(file.size || "0"),
+    };
+}
+
+async function listFiles(accessToken: string, bucket: string, env: Env): Promise<any[]> {
+    const folderId = await getOrCreateFolder(accessToken, bucket, env);
+
+    const listRes = await fetch(`https://www.googleapis.com/drive/v3/files?q='${folderId}' in parents and trashed=false&fields=files(id,name,mimeType,size,modifiedTime)`, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+    });
+
+    const data = await listRes.json();
+    return data.files || [];
+}
+
+function generateListBucketResult(files: any[], bucket: string): string {
+    const contents = files
+        .map(
+            (f) => `
+    <Contents>
+        <Key>${escapeXml(f.name)}</Key>
+        <LastModified>${f.modifiedTime || new Date().toISOString()}</LastModified>
+        <ETag>"${f.id}"</ETag>
+        <Size>${f.size || 0}</Size>
+        <StorageClass>STANDARD</StorageClass>
+    </Contents>`,
+        )
+        .join("");
+
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+    <Name>${escapeXml(bucket)}</Name>
+    <Prefix></Prefix>
+    <MaxKeys>1000</MaxKeys>
+    <IsTruncated>false</IsTruncated>
+    ${contents}
+</ListBucketResult>`;
+}
+
+function escapeXml(str: string): string {
+    return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+}
+
+// ========================================
+// AWS Signature V4 Verification
+// ========================================
+
 async function verifySignature(request: Request, env: Env): Promise<boolean> {
-    const start = performance.now();
     const url = new URL(request.url);
     const headers = request.headers;
 
-    // Query-based auth (Presigned URL) かどうか判定
     const isQueryAuth = url.searchParams.has("X-Amz-Algorithm");
 
     let algorithm: string;
@@ -66,27 +352,22 @@ async function verifySignature(request: Request, env: Env): Promise<boolean> {
         return false;
     }
 
-    // 日時情報の取得
     const datetime = (isQueryAuth ? url.searchParams.get("X-Amz-Date") : headers.get("x-amz-date")) ?? "";
 
     if (!datetime) return false;
 
     const date = datetime.substring(0, 8);
 
-    // Canonical Request の生成
     const canonicalRequest = await createCanonicalRequest(request, isQueryAuth);
     const hashedCanonicalRequest = await sha256(canonicalRequest);
 
-    // String to Sign の生成
     const credentialScope = `${date}/${env.REGION}/s3/aws4_request`;
     const stringToSign = ["AWS4-HMAC-SHA256", datetime, credentialScope, hashedCanonicalRequest].join("\n");
 
-    // 署名の計算
     const signingKey = await getSigningKey(env.SECRET_KEY, date, env.REGION, "s3");
     const signature = await hmacSha256(signingKey, stringToSign);
     const signatureHex = bufToHex(signature);
 
-    // 期待される署名の取得
     let expectedSignature = "";
     if (isQueryAuth) {
         expectedSignature = url.searchParams.get("X-Amz-Signature") ?? "";
@@ -96,38 +377,18 @@ async function verifySignature(request: Request, env: Env): Promise<boolean> {
         expectedSignature = match ? match[1] : "";
     }
 
-    // デバッグ用
-    if (signatureHex !== expectedSignature) {
-        console.log("Signature mismatch!");
-        console.log("Canonical Request:", canonicalRequest);
-        console.log("String to Sign:", stringToSign);
-        console.log("Computed:", signatureHex);
-        console.log("Expected:", expectedSignature);
-    }
-
-    const end = performance.now();
-    const cpuUsed = end - start;
-
-    console.debug(`CPU time used: ${cpuUsed}ms`);
-
     return signatureHex === expectedSignature;
 }
 
 async function createCanonicalRequest(request: Request, isQueryAuth: boolean): Promise<string> {
     const url = new URL(request.url);
 
-    // HTTPメソッド
     const method = request.method;
-
-    // Canonical URI (パス部分)
     const canonicalUri = url.pathname || "/";
 
-    // Canonical Query String
-    // AWS署名バージョン4では、パラメータ名の大文字小文字を区別してソート
     const params = Array.from(url.searchParams.entries())
-        .filter(([key]) => key !== "X-Amz-Signature") // 署名自体は除外
+        .filter(([key]) => key !== "X-Amz-Signature")
         .sort(([a], [b]) => {
-            // バイナリソート（大文字小文字を区別）
             if (a < b) return -1;
             if (a > b) return 1;
             return 0;
@@ -135,7 +396,6 @@ async function createCanonicalRequest(request: Request, isQueryAuth: boolean): P
         .map(([key, val]) => `${encodeRFC3986(key)}=${encodeRFC3986(val)}`)
         .join("&");
 
-    // Signed Headers の取得
     let signedHeadersList: string[];
     if (isQueryAuth) {
         signedHeadersList = (url.searchParams.get("X-Amz-SignedHeaders") ?? "host").split(";");
@@ -145,16 +405,13 @@ async function createCanonicalRequest(request: Request, isQueryAuth: boolean): P
         signedHeadersList = match ? match[1].split(";") : ["host"];
     }
 
-    // Canonical Headers の生成
     const canonicalHeaders = signedHeadersList
         .map((h) => {
             const headerName = h.toLowerCase();
             let headerValue = "";
 
             if (headerName === "host") {
-                // ホストヘッダーをそのまま使用（URLのhostnameを使用）
                 headerValue = url.hostname;
-                // 非標準ポートの場合はポート番号を追加
                 const port = url.port;
                 if (port && !((url.protocol === "https:" && port === "443") || (url.protocol === "http:" && port === "80"))) {
                     headerValue += `:${port}`;
@@ -168,14 +425,11 @@ async function createCanonicalRequest(request: Request, isQueryAuth: boolean): P
         .join("");
 
     const signedHeaders = signedHeadersList.join(";");
-
-    // Payload Hash
     const payloadHash = request.headers.get("x-amz-content-sha256") ?? (isQueryAuth ? "UNSIGNED-PAYLOAD" : "UNSIGNED-PAYLOAD");
 
     return [method, canonicalUri, params, canonicalHeaders, signedHeaders, payloadHash].join("\n");
 }
 
-// RFC3986に準拠したURLエンコーディング
 function encodeRFC3986(str: string): string {
     return encodeURIComponent(str).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
 }
