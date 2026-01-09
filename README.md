@@ -48,7 +48,7 @@ token = {
 ```
 
 ### 2. Configure Cloudflare
-From the Cloudflare dashboard, create two KV databases.
+From the Cloudflare dashboard, create two KV databases.  
 Create a fork of this repository, edit `wrangler.json`, and modify the binding to the ID of your KV database.
 
 Once complete, deploy Workers by running the following command:
