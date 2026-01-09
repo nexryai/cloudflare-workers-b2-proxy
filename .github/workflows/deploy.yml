@@ -29,9 +29,6 @@ jobs:
       - name: Install dependencies
         run: pnpm install
 
-      - name: Build with tsc
-        run: pnpm build
-
       - name: Deploy to Cloudflare Workers
         run: pnpm run deploy
         env:
