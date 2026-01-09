@@ -30,7 +30,7 @@ Once complete, obtain the path to your rclone configuration file using `rclone c
 [my-remote]
 type = drive
 # Use as GOOGLE_CLIENT_ID
-client_id = myud.apps.googleusercontent.com
+client_id = myid.apps.googleusercontent.com
 # Use as GOOGLE_CLIENT_SECRET
 client_secret = SUPER_SECRET_TOKEN
 scope = drive
