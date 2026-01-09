@@ -1,7 +1,7 @@
 name: Deploy CI
 on:
   push:
-    branches: ["nightly"]
+    branches: ["main"]
 
 permissions: {}
 
@@ -27,15 +27,9 @@ jobs:
         run: npm install -g pnpm
 
       - name: Install dependencies
-        working-directory: cdn
         run: pnpm install
 
-      - name: Build with tsc
-        working-directory: cdn
-        run: pnpm build
-
       - name: Deploy to Cloudflare Workers
-        working-directory: cdn
         run: pnpm run deploy
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
