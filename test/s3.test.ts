@@ -214,6 +214,7 @@ describe("S3 API Server with Google Drive Backend", () => {
     // 5. Presigned URL テスト
     it("should verify presigned URLs from @aws-sdk/s3-request-presigner", async () => {
         const s3 = new S3Client({
+            endpoint: `${endpoint}/my-bucket`,
             region: ENV.REGION,
             credentials: {
                 accessKeyId: ENV.ACCESS_KEY,
@@ -223,7 +224,7 @@ describe("S3 API Server with Google Drive Backend", () => {
 
         const command = new GetObjectCommand({
             Bucket: "my-bucket",
-            Key: "my-bucket/test.png",
+            Key: "test.png",
         });
 
         const url = await getSignedUrl(s3, command, { expiresIn: 3600 });
