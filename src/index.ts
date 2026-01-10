@@ -263,6 +263,8 @@ async function streamUploadToDrive(accessToken: string, stream: ReadableStream |
 
     const uploadUrl = initRes.headers.get("Location");
     if (!uploadUrl) {
+        console.error(initRes.status);
+        console.error(await initRes.text());
         throw new Error("Failed to get upload URL");
     }
 
