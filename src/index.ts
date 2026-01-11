@@ -64,6 +64,7 @@ export default {
                         headers: {
                             "Content-Type": fileStream.contentType,
                             "Content-Length": fileStream.size.toString(),
+                            "Cache-Control": "s-maxage=300, no-store",
                             ETag: `"${fileStream.id}"`,
                         },
                     });
