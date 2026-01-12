@@ -309,6 +309,8 @@ async function streamDownloadFromDrive(accessToken: string, bucket: string, obje
     });
 
     if (!downloadRes.ok) {
+        console.error(downloadRes.status);
+        console.error(await downloadRes.text());
         throw new Error("Download failed");
     }
 
