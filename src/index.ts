@@ -1,6 +1,6 @@
 /**
  * S3-Compatible API Server on Cloudflare Workers
- * Backend: Google Drive with streaming support
+ * Backend: Google Drive with streaming support and nested directory structure
  */
 
 export default {
@@ -204,13 +204,15 @@ async function getAccessToken(env: Env): Promise<string> {
     return data.access_token;
 }
 
-async function getOrCreateFolder(accessToken: string, folderName: string, env: Env): Promise<string> {
-    // キャッシュを確認
-    const cached = await env.FOLDER_CACHE.get(folderName);
+async function getOrCreateFolder(accessToken: string, folderName: string, parentId: string | null, env: Env): Promise<string> {
+    // キャッシュキーにparentIdを含める
+    const cacheKey = parentId ? `${parentId}/${folderName}` : folderName;
+    const cached = await env.FOLDER_CACHE.get(cacheKey);
     if (cached) return cached;
 
-    // フォルダを検索
-    const searchRes = await fetch(`https://www.googleapis.com/drive/v3/files?q=name='${encodeURIComponent(folderName)}' and mimeType='application/vnd.google-apps.folder' and trashed=false`, {
+    // フォルダを検索（親フォルダを指定）
+    const parentQuery = parentId ? ` and '${parentId}' in parents` : "";
+    const searchRes = await fetch(`https://www.googleapis.com/drive/v3/files?q=name='${encodeURIComponent(folderName)}' and mimeType='application/vnd.google-apps.folder' and trashed=false${parentQuery}`, {
         headers: { Authorization: `Bearer ${accessToken}` },
     });
 
@@ -218,26 +220,56 @@ async function getOrCreateFolder(accessToken: string, folderName: string, env: E
 
     if (searchData.files && searchData.files.length > 0) {
         const folderId = searchData.files[0].id;
-        await env.FOLDER_CACHE.put(folderName, folderId, { expirationTtl: 3600 });
+        await env.FOLDER_CACHE.put(cacheKey, folderId, { expirationTtl: 3600 });
         return folderId;
     }
 
     // フォルダが存在しない場合は作成
+    const createBody: any = {
+        name: folderName,
+        mimeType: "application/vnd.google-apps.folder",
+    };
+
+    if (parentId) {
+        createBody.parents = [parentId];
+    }
+
     const createRes = await fetch("https://www.googleapis.com/drive/v3/files", {
         method: "POST",
         headers: {
             Authorization: `Bearer ${accessToken}`,
             "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-            name: folderName,
-            mimeType: "application/vnd.google-apps.folder",
-        }),
+        body: JSON.stringify(createBody),
     });
 
     const createData: any = await createRes.json();
-    await env.FOLDER_CACHE.put(folderName, createData.id, { expirationTtl: 3600 });
+    await env.FOLDER_CACHE.put(cacheKey, createData.id, { expirationTtl: 3600 });
     return createData.id;
+}
+
+async function resolvePathToFolderAndFile(accessToken: string, bucket: string, objectKey: string, env: Env): Promise<{ parentFolderId: string; fileName: string }> {
+    // バケットのルートフォルダを取得
+    let currentFolderId = await getOrCreateFolder(accessToken, bucket, null, env);
+
+    // objectKeyを/で分割
+    const parts = objectKey.split("/").filter((p) => p);
+
+    if (parts.length === 0) {
+        throw new Error("Invalid object key");
+    }
+
+    const fileName = parts[parts.length - 1];
+    const directories = parts.slice(0, -1);
+
+    for (const dir of directories) {
+        currentFolderId = await getOrCreateFolder(accessToken, dir, currentFolderId, env);
+    }
+
+    return {
+        parentFolderId: currentFolderId,
+        fileName: fileName,
+    };
 }
 
 async function streamUploadToDrive(accessToken: string, stream: ReadableStream | null, bucket: string, objectKey: string, mimeType: string, env: Env): Promise<any> {
@@ -245,8 +277,8 @@ async function streamUploadToDrive(accessToken: string, stream: ReadableStream |
         throw new Error("Request body is required");
     }
 
-    // バケット名に対応するフォルダIDを取得
-    const folderId = await getOrCreateFolder(accessToken, bucket, env);
+    // パスを解析してフォルダ階層を作成
+    const { parentFolderId, fileName } = await resolvePathToFolderAndFile(accessToken, bucket, objectKey, env);
 
     // Resumable uploadの初期化
     const initRes = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable", {
@@ -257,8 +289,8 @@ async function streamUploadToDrive(accessToken: string, stream: ReadableStream |
             "Content-Type": "application/json; charset=UTF-8",
         },
         body: JSON.stringify({
-            name: objectKey,
-            parents: [folderId],
+            name: fileName,
+            parents: [parentFolderId],
         }),
     });
 
@@ -297,18 +329,18 @@ async function findFileInFolder(accessToken: string, folderId: string, fileName:
 }
 
 async function streamDownloadFromDrive(accessToken: string, bucket: string, objectKey: string, env: Env): Promise<{ body: ReadableStream; contentType: string; size: number; id: string }> {
-    const folderId = await getOrCreateFolder(accessToken, bucket, env);
-    const file = await findFileInFolder(accessToken, folderId, objectKey);
+    const { parentFolderId, fileName } = await resolvePathToFolderAndFile(accessToken, bucket, objectKey, env);
+    const file = await findFileInFolder(accessToken, parentFolderId, fileName);
 
     if (!file) {
         throw new Error("File not found");
     }
 
-    const controller = new AbortController();  
+    const controller = new AbortController();
     const timeout = setTimeout(() => {
         controller.abort();
     }, 5000);
-    
+
     const downloadRes = await fetch(`https://www.googleapis.com/drive/v3/files/${file.id}?alt=media`, {
         headers: { Authorization: `Bearer ${accessToken}` },
         signal: controller.signal,
@@ -331,8 +363,8 @@ async function streamDownloadFromDrive(accessToken: string, bucket: string, obje
 }
 
 async function deleteFromDrive(accessToken: string, bucket: string, objectKey: string, env: Env): Promise<void> {
-    const folderId = await getOrCreateFolder(accessToken, bucket, env);
-    const file = await findFileInFolder(accessToken, folderId, objectKey);
+    const { parentFolderId, fileName } = await resolvePathToFolderAndFile(accessToken, bucket, objectKey, env);
+    const file = await findFileInFolder(accessToken, parentFolderId, fileName);
 
     if (!file) {
         throw new Error("File not found");
@@ -349,8 +381,8 @@ async function deleteFromDrive(accessToken: string, bucket: string, objectKey: s
 }
 
 async function getFileMetadata(accessToken: string, bucket: string, objectKey: string, env: Env): Promise<{ id: string; mimeType: string; size: number }> {
-    const folderId = await getOrCreateFolder(accessToken, bucket, env);
-    const file = await findFileInFolder(accessToken, folderId, objectKey);
+    const { parentFolderId, fileName } = await resolvePathToFolderAndFile(accessToken, bucket, objectKey, env);
+    const file = await findFileInFolder(accessToken, parentFolderId, fileName);
 
     if (!file) {
         throw new Error("File not found");
@@ -364,7 +396,7 @@ async function getFileMetadata(accessToken: string, bucket: string, objectKey: s
 }
 
 async function listFiles(accessToken: string, bucket: string, env: Env): Promise<GoogleDriveFile[]> {
-    const folderId = await getOrCreateFolder(accessToken, bucket, env);
+    const folderId = await getOrCreateFolder(accessToken, bucket, null, env);
 
     const listRes = await fetch(`https://www.googleapis.com/drive/v3/files?q='${folderId}' in parents and trashed=false&fields=files(id,name,mimeType,size,modifiedTime)`, {
         headers: { Authorization: `Bearer ${accessToken}` },

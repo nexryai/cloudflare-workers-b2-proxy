@@ -140,7 +140,6 @@ describe("S3 API Server with Google Drive Backend", () => {
 
         const response = await worker.fetch(signedReq, ENV, CTX);
         expect(response.status).toBe(200);
-
         const result = await response.json();
         expect(result).toHaveProperty("id");
     });
@@ -229,7 +228,6 @@ describe("S3 API Server with Google Drive Backend", () => {
 
         const url = await getSignedUrl(s3, command, { expiresIn: 3600 });
         const parsedUrl = new URL(url);
-
         const testUrl = new URL(endpoint);
         testUrl.hostname = parsedUrl.hostname;
         testUrl.pathname = parsedUrl.pathname;
@@ -237,7 +235,6 @@ describe("S3 API Server with Google Drive Backend", () => {
 
         const request = new Request(testUrl.toString(), { method: "GET" });
         const response = await worker.fetch(request, ENV, CTX);
-
         expect(response.status).toBe(200);
     });
 
@@ -264,7 +261,6 @@ describe("S3 API Server with Google Drive Backend", () => {
             service: "s3",
         });
 
-        // ファイル一覧を返すようにモックを更新
         const originalFetch = global.fetch;
         (global.fetch as any) = vi.fn(async (url: string, init?: any) => {
             const urlStr = typeof url === "string" ? url : url.toString();
@@ -313,7 +309,6 @@ describe("S3 API Server with Google Drive Backend", () => {
 
         const response = await worker.fetch(signedReq, ENV, CTX);
         expect(response.status).toBe(200);
-
         const xmlText = await response.text();
         expect(xmlText).toContain("<ListBucketResult");
         expect(xmlText).toContain("file1.txt");
@@ -331,7 +326,6 @@ describe("S3 API Server with Google Drive Backend", () => {
             service: "s3",
         });
 
-        // ファイルが見つからないケース
         const originalFetch = global.fetch;
         (global.fetch as any) = vi.fn(async (url: string, init?: any) => {
             const urlStr = typeof url === "string" ? url : url.toString();
@@ -356,7 +350,6 @@ describe("S3 API Server with Google Drive Backend", () => {
             }
 
             if (urlStr.includes("drive/v3/files") && urlStr.includes("in parents")) {
-                // ファイルが存在しない
                 return new Response(JSON.stringify({ files: [] }), { status: 200 });
             }
 
@@ -533,10 +526,494 @@ describe("S3 API Server with Google Drive Backend", () => {
 
         const response = await worker.fetch(signedReq, ENV, CTX);
         expect(response.status).toBe(200);
-
         const xmlText = await response.text();
         expect(xmlText).toContain("<ListBucketResult");
         expect(xmlText).not.toContain("<Contents>");
+
+        global.fetch = originalFetch;
+    });
+
+    // 12. ネストされたフォルダーへのアップロード
+    it("should upload file to nested directory structure", async () => {
+        const aws4 = new AwsClient({
+            accessKeyId: ENV.ACCESS_KEY,
+            secretAccessKey: ENV.SECRET_KEY,
+            region: ENV.REGION,
+            service: "s3",
+        });
+
+        const folderIds = {
+            bucket: "bucket-id-123",
+            dir1: "dir1-id-456",
+            dir2: "dir2-id-789",
+        };
+
+        const originalFetch = global.fetch;
+        (global.fetch as any) = vi.fn(async (url: string, init?: any) => {
+            const urlStr = typeof url === "string" ? url : url.toString();
+
+            // OAuth トークン
+            if (urlStr.includes("oauth2.googleapis.com/token")) {
+                return new Response(
+                    JSON.stringify({
+                        access_token: "mock-access-token",
+                        expires_in: 3600,
+                    }),
+                    { status: 200 },
+                );
+            }
+
+            // フォルダ作成 (POST)
+            if (urlStr === "https://www.googleapis.com/drive/v3/files" && init?.method === "POST") {
+                const body = JSON.parse(init.body);
+                if (body.mimeType === "application/vnd.google-apps.folder") {
+                    // フォルダ名に応じてIDを返す
+                    if (body.name === "dir1") {
+                        return new Response(JSON.stringify({ id: folderIds.dir1, name: "dir1" }), { status: 200 });
+                    } else if (body.name === "dir2") {
+                        return new Response(JSON.stringify({ id: folderIds.dir2, name: "dir2" }), { status: 200 });
+                    }
+                }
+            }
+
+            // フォルダ検索 - バケット (親なし)
+            if (urlStr.includes("name='test-bucket'") && urlStr.includes("mimeType='application/vnd.google-apps.folder'") && !urlStr.includes("in parents")) {
+                return new Response(
+                    JSON.stringify({
+                        files: [{ id: folderIds.bucket, name: "test-bucket" }],
+                    }),
+                    { status: 200 },
+                );
+            }
+
+            // フォルダ検索 - dir1
+            if (urlStr.includes("name='dir1'") && urlStr.includes("mimeType='application/vnd.google-apps.folder'")) {
+                if (urlStr.includes(`'${folderIds.bucket}' in parents`)) {
+                    return new Response(
+                        JSON.stringify({
+                            files: [{ id: folderIds.dir1, name: "dir1" }],
+                        }),
+                        { status: 200 },
+                    );
+                } else {
+                    return new Response(JSON.stringify({ files: [] }), { status: 200 });
+                }
+            }
+
+            // フォルダ検索 - dir2
+            if (urlStr.includes("name='dir2'") && urlStr.includes("mimeType='application/vnd.google-apps.folder'")) {
+                if (urlStr.includes(`'${folderIds.dir1}' in parents`)) {
+                    return new Response(
+                        JSON.stringify({
+                            files: [{ id: folderIds.dir2, name: "dir2" }],
+                        }),
+                        { status: 200 },
+                    );
+                } else {
+                    return new Response(JSON.stringify({ files: [] }), { status: 200 });
+                }
+            }
+
+            // Resumable upload 初期化
+            if (urlStr.includes("uploadType=resumable") && init?.method === "POST") {
+                const body = JSON.parse(init.body);
+                // 親フォルダがdir2であることを確認
+                expect(body.parents).toEqual([folderIds.dir2]);
+                expect(body.name).toBe("file.txt");
+
+                return new Response(null, {
+                    status: 200,
+                    headers: { Location: "https://www.googleapis.com/upload/drive/v3/files/uploadid999" },
+                });
+            }
+
+            // Resumable upload 実行
+            if (urlStr.includes("upload/drive/v3/files/uploadid999")) {
+                return new Response(
+                    JSON.stringify({
+                        id: "nested-file-id-999",
+                        name: "file.txt",
+                        mimeType: "text/plain",
+                    }),
+                    { status: 200 },
+                );
+            }
+
+            console.error("Unhandled URL:", urlStr);
+            return new Response(JSON.stringify({ error: "Not Found" }), { status: 404 });
+        });
+
+        const requestUrl = `${endpoint}/test-bucket/dir1/dir2/file.txt`;
+        const signedReq = await aws4.sign(requestUrl, {
+            method: "PUT",
+            headers: {
+                "Content-Type": "text/plain",
+                "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
+            },
+            body: "Nested content",
+        });
+
+        const response = await worker.fetch(signedReq, ENV, CTX);
+        expect(response.status).toBe(200);
+        const result = await response.json();
+        expect(result.id).toBe("nested-file-id-999");
+        expect(result.name).toBe("file.txt");
+
+        global.fetch = originalFetch;
+    });
+
+    // 13. ネストされたフォルダーからのダウンロード
+    it("should download file from nested directory structure", async () => {
+        const aws4 = new AwsClient({
+            accessKeyId: ENV.ACCESS_KEY,
+            secretAccessKey: ENV.SECRET_KEY,
+            region: ENV.REGION,
+            service: "s3",
+        });
+
+        const folderIds = {
+            bucket: "bucket-id-123",
+            images: "images-id-456",
+            photos: "photos-id-789",
+        };
+
+        const originalFetch = global.fetch;
+        (global.fetch as any) = vi.fn(async (url: string, init?: any) => {
+            const urlStr = typeof url === "string" ? url : url.toString();
+
+            if (urlStr.includes("oauth2.googleapis.com/token")) {
+                return new Response(
+                    JSON.stringify({
+                        access_token: "mock-access-token",
+                        expires_in: 3600,
+                    }),
+                    { status: 200 },
+                );
+            }
+
+            // フォルダ作成 (POST)
+            if (urlStr === "https://www.googleapis.com/drive/v3/files" && init?.method === "POST") {
+                const body = JSON.parse(init.body);
+                if (body.mimeType === "application/vnd.google-apps.folder") {
+                    if (body.name === "images") {
+                        return new Response(JSON.stringify({ id: folderIds.images, name: "images" }), { status: 200 });
+                    } else if (body.name === "photos") {
+                        return new Response(JSON.stringify({ id: folderIds.photos, name: "photos" }), { status: 200 });
+                    }
+                }
+            }
+
+            // バケット検索
+            if (urlStr.includes("name='test-bucket'") && urlStr.includes("mimeType='application/vnd.google-apps.folder'") && !urlStr.includes("in parents")) {
+                return new Response(
+                    JSON.stringify({
+                        files: [{ id: folderIds.bucket, name: "test-bucket" }],
+                    }),
+                    { status: 200 },
+                );
+            }
+
+            // images フォルダ検索
+            if (urlStr.includes("name='images'") && urlStr.includes("mimeType='application/vnd.google-apps.folder'")) {
+                if (urlStr.includes(`'${folderIds.bucket}' in parents`)) {
+                    return new Response(
+                        JSON.stringify({
+                            files: [{ id: folderIds.images, name: "images" }],
+                        }),
+                        { status: 200 },
+                    );
+                } else {
+                    return new Response(JSON.stringify({ files: [] }), { status: 200 });
+                }
+            }
+
+            // photos フォルダ検索
+            if (urlStr.includes("name='photos'") && urlStr.includes("mimeType='application/vnd.google-apps.folder'")) {
+                if (urlStr.includes(`'${folderIds.images}' in parents`)) {
+                    return new Response(
+                        JSON.stringify({
+                            files: [{ id: folderIds.photos, name: "photos" }],
+                        }),
+                        { status: 200 },
+                    );
+                } else {
+                    return new Response(JSON.stringify({ files: [] }), { status: 200 });
+                }
+            }
+
+            // ファイル検索 - photo.jpg
+            if (urlStr.includes("name='photo.jpg'") && urlStr.includes(`'${folderIds.photos}' in parents`)) {
+                return new Response(
+                    JSON.stringify({
+                        files: [
+                            {
+                                id: "photo-file-id-999",
+                                name: "photo.jpg",
+                                mimeType: "image/jpeg",
+                                size: "12345",
+                            },
+                        ],
+                    }),
+                    { status: 200 },
+                );
+            }
+
+            // ファイルダウンロード
+            if (urlStr.includes("photo-file-id-999") && urlStr.includes("alt=media")) {
+                return new Response("Binary image data", {
+                    status: 200,
+                    headers: { "Content-Type": "image/jpeg" },
+                });
+            }
+
+            console.error("Unhandled URL:", urlStr);
+            return new Response(JSON.stringify({ error: "Not Found" }), { status: 404 });
+        });
+
+        const requestUrl = `${endpoint}/test-bucket/images/photos/photo.jpg`;
+        const signedReq = await aws4.sign(requestUrl, {
+            method: "GET",
+            headers: {
+                "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
+            },
+        });
+
+        const response = await worker.fetch(signedReq, ENV, CTX);
+        expect(response.status).toBe(200);
+        expect(response.headers.get("Content-Type")).toBe("image/jpeg");
+        expect(await response.text()).toBe("Binary image data");
+
+        global.fetch = originalFetch;
+    });
+
+    // 14. ネストされたフォルダーからの削除
+    it("should delete file from nested directory structure", async () => {
+        const aws4 = new AwsClient({
+            accessKeyId: ENV.ACCESS_KEY,
+            secretAccessKey: ENV.SECRET_KEY,
+            region: ENV.REGION,
+            service: "s3",
+        });
+
+        const folderIds = {
+            bucket: "bucket-id-123",
+            docs: "docs-id-456",
+            archive: "archive-id-789",
+        };
+
+        const originalFetch = global.fetch;
+        (global.fetch as any) = vi.fn(async (url: string, init?: any) => {
+            const urlStr = typeof url === "string" ? url : url.toString();
+
+            if (urlStr.includes("oauth2.googleapis.com/token")) {
+                return new Response(
+                    JSON.stringify({
+                        access_token: "mock-access-token",
+                        expires_in: 3600,
+                    }),
+                    { status: 200 },
+                );
+            }
+
+            // フォルダ作成 (POST)
+            if (urlStr === "https://www.googleapis.com/drive/v3/files" && init?.method === "POST") {
+                const body = JSON.parse(init.body);
+                if (body.mimeType === "application/vnd.google-apps.folder") {
+                    if (body.name === "docs") {
+                        return new Response(JSON.stringify({ id: folderIds.docs, name: "docs" }), { status: 200 });
+                    } else if (body.name === "archive") {
+                        return new Response(JSON.stringify({ id: folderIds.archive, name: "archive" }), { status: 200 });
+                    }
+                }
+            }
+
+            if (urlStr.includes("name='test-bucket'") && urlStr.includes("mimeType='application/vnd.google-apps.folder'") && !urlStr.includes("in parents")) {
+                return new Response(
+                    JSON.stringify({
+                        files: [{ id: folderIds.bucket, name: "test-bucket" }],
+                    }),
+                    { status: 200 },
+                );
+            }
+
+            if (urlStr.includes("name='docs'") && urlStr.includes("mimeType='application/vnd.google-apps.folder'")) {
+                if (urlStr.includes(`'${folderIds.bucket}' in parents`)) {
+                    return new Response(
+                        JSON.stringify({
+                            files: [{ id: folderIds.docs, name: "docs" }],
+                        }),
+                        { status: 200 },
+                    );
+                } else {
+                    return new Response(JSON.stringify({ files: [] }), { status: 200 });
+                }
+            }
+
+            if (urlStr.includes("name='archive'") && urlStr.includes("mimeType='application/vnd.google-apps.folder'")) {
+                if (urlStr.includes(`'${folderIds.docs}' in parents`)) {
+                    return new Response(
+                        JSON.stringify({
+                            files: [{ id: folderIds.archive, name: "archive" }],
+                        }),
+                        { status: 200 },
+                    );
+                } else {
+                    return new Response(JSON.stringify({ files: [] }), { status: 200 });
+                }
+            }
+
+            if (urlStr.includes("name='old.pdf'") && urlStr.includes(`'${folderIds.archive}' in parents`)) {
+                return new Response(
+                    JSON.stringify({
+                        files: [
+                            {
+                                id: "old-pdf-id-999",
+                                name: "old.pdf",
+                                mimeType: "application/pdf",
+                                size: "54321",
+                            },
+                        ],
+                    }),
+                    { status: 200 },
+                );
+            }
+
+            if (urlStr.includes("old-pdf-id-999") && init?.method === "DELETE") {
+                return new Response(null, { status: 204 });
+            }
+
+            console.error("Unhandled URL:", urlStr);
+            return new Response(JSON.stringify({ error: "Not Found" }), { status: 404 });
+        });
+
+        const requestUrl = `${endpoint}/test-bucket/docs/archive/old.pdf`;
+        const signedReq = await aws4.sign(requestUrl, {
+            method: "DELETE",
+            headers: {
+                "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
+            },
+        });
+
+        const response = await worker.fetch(signedReq, ENV, CTX);
+        expect(response.status).toBe(204);
+
+        global.fetch = originalFetch;
+    });
+
+    // 15. 深くネストされたフォルダーのメタデータ取得
+    it("should get metadata for file in deeply nested structure", async () => {
+        const aws4 = new AwsClient({
+            accessKeyId: ENV.ACCESS_KEY,
+            secretAccessKey: ENV.SECRET_KEY,
+            region: ENV.REGION,
+            service: "s3",
+        });
+
+        const folderIds = {
+            bucket: "bucket-id-123",
+            a: "a-id-111",
+            b: "b-id-222",
+            c: "c-id-333",
+            d: "d-id-444",
+        };
+
+        const originalFetch = global.fetch;
+        (global.fetch as any) = vi.fn(async (url: string, init?: any) => {
+            const urlStr = typeof url === "string" ? url : url.toString();
+
+            if (urlStr.includes("oauth2.googleapis.com/token")) {
+                return new Response(
+                    JSON.stringify({
+                        access_token: "mock-access-token",
+                        expires_in: 3600,
+                    }),
+                    { status: 200 },
+                );
+            }
+
+            // フォルダ作成 (POST)
+            if (urlStr === "https://www.googleapis.com/drive/v3/files" && init?.method === "POST") {
+                const body = JSON.parse(init.body);
+                if (body.mimeType === "application/vnd.google-apps.folder") {
+                    if (body.name === "a") {
+                        return new Response(JSON.stringify({ id: folderIds.a, name: "a" }), { status: 200 });
+                    } else if (body.name === "b") {
+                        return new Response(JSON.stringify({ id: folderIds.b, name: "b" }), { status: 200 });
+                    } else if (body.name === "c") {
+                        return new Response(JSON.stringify({ id: folderIds.c, name: "c" }), { status: 200 });
+                    } else if (body.name === "d") {
+                        return new Response(JSON.stringify({ id: folderIds.d, name: "d" }), { status: 200 });
+                    }
+                }
+            }
+
+            // フォルダ階層の検索
+            if (urlStr.includes("name='test-bucket'") && urlStr.includes("mimeType='application/vnd.google-apps.folder'") && !urlStr.includes("in parents")) {
+                return new Response(JSON.stringify({ files: [{ id: folderIds.bucket, name: "test-bucket" }] }), { status: 200 });
+            }
+            if (urlStr.includes("name='a'") && urlStr.includes("mimeType='application/vnd.google-apps.folder'")) {
+                if (urlStr.includes(`'${folderIds.bucket}' in parents`)) {
+                    return new Response(JSON.stringify({ files: [{ id: folderIds.a, name: "a" }] }), { status: 200 });
+                } else {
+                    return new Response(JSON.stringify({ files: [] }), { status: 200 });
+                }
+            }
+            if (urlStr.includes("name='b'") && urlStr.includes("mimeType='application/vnd.google-apps.folder'")) {
+                if (urlStr.includes(`'${folderIds.a}' in parents`)) {
+                    return new Response(JSON.stringify({ files: [{ id: folderIds.b, name: "b" }] }), { status: 200 });
+                } else {
+                    return new Response(JSON.stringify({ files: [] }), { status: 200 });
+                }
+            }
+            if (urlStr.includes("name='c'") && urlStr.includes("mimeType='application/vnd.google-apps.folder'")) {
+                if (urlStr.includes(`'${folderIds.b}' in parents`)) {
+                    return new Response(JSON.stringify({ files: [{ id: folderIds.c, name: "c" }] }), { status: 200 });
+                } else {
+                    return new Response(JSON.stringify({ files: [] }), { status: 200 });
+                }
+            }
+            if (urlStr.includes("name='d'") && urlStr.includes("mimeType='application/vnd.google-apps.folder'")) {
+                if (urlStr.includes(`'${folderIds.c}' in parents`)) {
+                    return new Response(JSON.stringify({ files: [{ id: folderIds.d, name: "d" }] }), { status: 200 });
+                } else {
+                    return new Response(JSON.stringify({ files: [] }), { status: 200 });
+                }
+            }
+
+            // ファイル検索
+            if (urlStr.includes("name='deep.txt'") && urlStr.includes(`'${folderIds.d}' in parents`)) {
+                return new Response(
+                    JSON.stringify({
+                        files: [
+                            {
+                                id: "deep-file-id-999",
+                                name: "deep.txt",
+                                mimeType: "text/plain",
+                                size: "999",
+                            },
+                        ],
+                    }),
+                    { status: 200 },
+                );
+            }
+
+            console.error("Unhandled URL:", urlStr);
+            return new Response(JSON.stringify({ error: "Not Found" }), { status: 404 });
+        });
+
+        const requestUrl = `${endpoint}/test-bucket/a/b/c/d/deep.txt`;
+        const signedReq = await aws4.sign(requestUrl, {
+            method: "HEAD",
+            headers: {
+                "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
+            },
+        });
+
+        const response = await worker.fetch(signedReq, ENV, CTX);
+        expect(response.status).toBe(200);
+        expect(response.headers.get("Content-Type")).toBe("text/plain");
+        expect(response.headers.get("Content-Length")).toBe("999");
+        expect(response.headers.get("ETag")).toBe('"deep-file-id-999"');
 
         global.fetch = originalFetch;
     });
