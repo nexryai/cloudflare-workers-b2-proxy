@@ -1,6 +1,7 @@
 /**
- * S3-Compatible API Server on Cloudflare Workers
+ * S3-Compatible API Server on Cloudflare Workers with Cache API
  * Backend: Backblaze B2 with aws4fetch for S3-compatible access
+ * Cache: Cloudflare Cache API for GET requests (streaming maintained)
  */
 
 import { AwsClient } from "aws4fetch";
@@ -48,6 +49,10 @@ export default {
                 const contentType = request.headers.get("Content-Type") || "application/octet-stream";
                 const result = await uploadToB2(b2Client, b2Endpoint, bucket, objectKey, request.body, contentType);
 
+                // アップロード成功時にキャッシュを無効化
+                const cacheKey = createCacheKey(url, bucket, objectKey);
+                ctx.waitUntil(caches.default.delete(cacheKey));
+
                 return new Response(JSON.stringify(result), {
                     status: 200,
                     headers: {
@@ -58,7 +63,7 @@ export default {
             } else if (method === "GET") {
                 // ダウンロードまたはリスト
                 if (!objectKey) {
-                    // バケット内のオブジェクト一覧
+                    // バケット内のオブジェクト一覧（キャッシュなし）
                     const files = await listB2Objects(b2Client, b2Endpoint, bucket);
                     return new Response(files, {
                         status: 200,
@@ -66,25 +71,8 @@ export default {
                     });
                 }
 
-                try {
-                    const fileStream = await downloadFromB2(b2Client, b2Endpoint, bucket, objectKey);
-
-                    return new Response(fileStream.body, {
-                        status: 200,
-                        headers: {
-                            "Content-Type": fileStream.contentType,
-                            "Content-Length": fileStream.contentLength,
-                            "Cache-Control": "s-maxage=300, no-store",
-                            ETag: fileStream.etag,
-                        },
-                    });
-                } catch (e) {
-                    const error = e as Error;
-                    if (error.message.includes("404") || error.message.includes("NoSuchKey")) {
-                        return new Response("NoSuchKey", { status: 404 });
-                    }
-                    throw e;
-                }
+                // オブジェクトのダウンロード（キャッシュあり）
+                return await handleCachedGet(request, b2Client, b2Endpoint, bucket, objectKey, ctx);
             } else if (method === "DELETE") {
                 // オブジェクト削除
                 if (!objectKey) {
@@ -93,6 +81,11 @@ export default {
 
                 try {
                     await deleteFromB2(b2Client, b2Endpoint, bucket, objectKey);
+
+                    // 削除成功時にキャッシュを無効化
+                    const cacheKey = createCacheKey(url, bucket, objectKey);
+                    ctx.waitUntil(caches.default.delete(cacheKey));
+
                     return new Response(null, { status: 204 });
                 } catch (e) {
                     const error = e as Error;
@@ -102,28 +95,12 @@ export default {
                     throw e;
                 }
             } else if (method === "HEAD") {
-                // メタデータ取得
+                // メタデータ取得（キャッシュあり）
                 if (!objectKey) {
                     return new Response(null, { status: 400 });
                 }
 
-                try {
-                    const metadata = await headB2Object(b2Client, b2Endpoint, bucket, objectKey);
-                    return new Response(null, {
-                        status: 200,
-                        headers: {
-                            "Content-Type": metadata.contentType,
-                            "Content-Length": metadata.contentLength,
-                            ETag: metadata.etag,
-                        },
-                    });
-                } catch (e) {
-                    const error = e as Error;
-                    if (error.message.includes("404") || error.message.includes("NoSuchKey")) {
-                        return new Response(null, { status: 404 });
-                    }
-                    throw e;
-                }
+                return await handleCachedHead(request, b2Client, b2Endpoint, bucket, objectKey);
             }
 
             return new Response("Method not allowed", { status: 405 });
@@ -144,6 +121,7 @@ interface Env {
     B2_ENDPOINT: string;
     B2_REGION?: string;
     ALLOWED_BUCKETS?: string;
+    CACHE_TTL?: string; // キャッシュTTL（秒）デフォルト: 3600
 }
 
 function isAllowedBucket(bucket: string, env: Env): boolean {
@@ -164,6 +142,104 @@ function isAllowedBucket(bucket: string, env: Env): boolean {
 
     // バケット名が許可リストに含まれているかチェック
     return allowedBuckets.includes(bucket);
+}
+
+// ========================================
+// Cache API Functions
+// ========================================
+
+function createCacheKey(url: URL, bucket: string, objectKey: string): string {
+    // 認証パラメータを除外したクリーンなURLをキャッシュキーとして使用
+    const cacheUrl = new URL(url.origin + url.pathname);
+    return cacheUrl.toString();
+}
+
+async function handleCachedGet(request: Request, client: AwsClient, endpoint: string, bucket: string, objectKey: string, ctx: ExecutionContext): Promise<Response> {
+    const url = new URL(request.url);
+    const cache = caches.default;
+    const cacheKey = createCacheKey(url, bucket, objectKey);
+
+    // キャッシュを確認
+    let response = await cache.match(cacheKey);
+
+    if (response) {
+        // キャッシュヒット
+        console.log("Cache HIT:", cacheKey);
+        return new Response(response.body, {
+            status: response.status,
+            headers: response.headers,
+        });
+    }
+
+    // キャッシュミス: B2から取得
+    console.log("Cache MISS:", cacheKey);
+    try {
+        const fileStream = await downloadFromB2(client, endpoint, bucket, objectKey);
+
+        // レスポンスを作成（ストリーミングを維持）
+        response = new Response(fileStream.body, {
+            status: 200,
+            headers: {
+                "Content-Type": fileStream.contentType,
+                "Content-Length": fileStream.contentLength,
+                "Cache-Control": "public, max-age=3600",
+                ETag: fileStream.etag,
+            },
+        });
+
+        // 非同期でキャッシュに保存（ストリーミングレスポンスをブロックしない）
+        ctx.waitUntil(cache.put(cacheKey, response.clone()));
+
+        return response;
+    } catch (e) {
+        const error = e as Error;
+        if (error.message.includes("404") || error.message.includes("NoSuchKey")) {
+            return new Response("NoSuchKey", { status: 404 });
+        }
+        throw e;
+    }
+}
+
+async function handleCachedHead(request: Request, client: AwsClient, endpoint: string, bucket: string, objectKey: string): Promise<Response> {
+    const url = new URL(request.url);
+    const cache = caches.default;
+    const cacheKey = createCacheKey(url, bucket, objectKey);
+
+    // キャッシュを確認
+    const cachedResponse = await cache.match(cacheKey);
+
+    if (cachedResponse) {
+        // キャッシュヒット: ヘッダーのみ返す
+        console.log("Cache HIT (HEAD):", cacheKey);
+        return new Response(null, {
+            status: 200,
+            headers: {
+                "Content-Type": cachedResponse.headers.get("Content-Type") || "application/octet-stream",
+                "Content-Length": cachedResponse.headers.get("Content-Length") || "0",
+                ETag: cachedResponse.headers.get("ETag") || '""',
+            },
+        });
+    }
+
+    // キャッシュミス: B2から取得
+    console.log("Cache MISS (HEAD):", cacheKey);
+    try {
+        const metadata = await headB2Object(client, endpoint, bucket, objectKey);
+        return new Response(null, {
+            status: 200,
+            headers: {
+                "Content-Type": metadata.contentType,
+                "Content-Length": metadata.contentLength,
+                ETag: metadata.etag,
+            },
+        });
+    } catch (e) {
+        const error = e as Error;
+        if (error.message.includes("404") || error.message.includes("NoSuchKey")) {
+            return new Response(null, { status: 404 });
+        }
+        throw e;
+    }
 }
 
 // ========================================

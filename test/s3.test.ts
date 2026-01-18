@@ -2,7 +2,6 @@ import { GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { AwsClient } from "aws4fetch";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-
 import worker from "../src/index";
 
 const ENV = {
@@ -21,6 +20,66 @@ const CTX = {
     passThroughOnException: vi.fn(),
 };
 
+// Cache API Mock
+class MockCache {
+    private store = new Map<string, Response>();
+
+    async match(key: string): Promise<Response | undefined> {
+        const cached = this.store.get(key);
+        if (cached) {
+            // Response をクローンして返す（複数回読み取り可能にするため）
+            return new Response(cached.body, {
+                status: cached.status,
+                statusText: cached.statusText,
+                headers: new Headers(cached.headers),
+            });
+        }
+        return undefined;
+    }
+
+    async put(key: string, response: Response): Promise<void> {
+        // Response のクローンを保存
+        const clonedResponse = response.clone();
+        const body = await clonedResponse.text();
+        this.store.set(
+            key,
+            new Response(body, {
+                status: clonedResponse.status,
+                statusText: clonedResponse.statusText,
+                headers: new Headers(clonedResponse.headers),
+            }),
+        );
+    }
+
+    async delete(key: string): Promise<boolean> {
+        return this.store.delete(key);
+    }
+
+    clear(): void {
+        this.store.clear();
+    }
+
+    // デバッグ用
+    has(key: string): boolean {
+        return this.store.has(key);
+    }
+
+    size(): number {
+        return this.store.size;
+    }
+}
+
+const mockCacheStorage = new MockCache();
+
+// グローバル caches オブジェクトをモック
+global.caches = {
+    default: mockCacheStorage as any,
+    open: vi.fn(),
+    delete: vi.fn(),
+    has: vi.fn(),
+    keys: vi.fn(),
+} as any;
+
 const originalFetch = global.fetch;
 
 function createB2MockFetch() {
@@ -36,7 +95,6 @@ function createB2MockFetch() {
         const pathParts = urlObj.pathname.split("/").filter((p) => p);
         const bucket = pathParts[0] || "";
         const objectKey = pathParts.slice(1).join("/");
-
         const method = init?.method || "GET";
 
         // PUT (アップロード)
@@ -104,6 +162,7 @@ function createB2MockFetch() {
                 "dir1/dir2/file.txt": { content: "Nested content", contentType: "text/plain", size: "14" },
                 "images/photos/photo.jpg": { content: "Binary image data", contentType: "image/jpeg", size: "17" },
                 "test.png": { content: "PNG data", contentType: "image/png", size: "8" },
+                "cached-file.txt": { content: "Cached content", contentType: "text/plain", size: "14" },
             };
 
             const fileInfo = knownFiles[objectKey];
@@ -135,6 +194,7 @@ function createB2MockFetch() {
                 "test-file.txt": { contentType: "text/plain", size: "11" },
                 "a/b/c/d/deep.txt": { contentType: "text/plain", size: "999" },
                 "docs/archive/old.pdf": { contentType: "application/pdf", size: "54321" },
+                "cached-file.txt": { contentType: "text/plain", size: "14" },
             };
 
             const fileInfo = knownFiles[objectKey];
@@ -155,8 +215,7 @@ function createB2MockFetch() {
 
         // DELETE
         if (method === "DELETE") {
-            const knownFiles = ["test-file.txt", "docs/archive/old.pdf"];
-
+            const knownFiles = ["test-file.txt", "docs/archive/old.pdf", "cached-file.txt"];
             if (knownFiles.includes(objectKey)) {
                 return new Response(null, { status: 204 });
             }
@@ -174,6 +233,7 @@ describe("S3 API Server with Backblaze B2 Backend", () => {
 
     beforeEach(() => {
         vi.clearAllMocks();
+        mockCacheStorage.clear();
         global.fetch = createB2MockFetch();
     });
 
@@ -286,6 +346,7 @@ describe("S3 API Server with Backblaze B2 Backend", () => {
 
         const url = await getSignedUrl(s3, command, { expiresIn: 3600 });
         const parsedUrl = new URL(url);
+
         const testUrl = new URL(endpoint);
         testUrl.hostname = parsedUrl.hostname;
         testUrl.pathname = parsedUrl.pathname;
@@ -293,6 +354,7 @@ describe("S3 API Server with Backblaze B2 Backend", () => {
 
         const request = new Request(testUrl.toString(), { method: "GET" });
         const response = await worker.fetch(request, ENV, CTX);
+
         expect(response.status).toBe(200);
     });
 
@@ -470,7 +532,7 @@ describe("S3 API Server with Backblaze B2 Backend", () => {
         expect(await response.text()).toBe("Binary image data");
     });
 
-    // 許可されていないバケットへのアクセス拒否
+    // 14. 許可されていないバケットへのアクセス拒否
     it("should reject access to non-allowed buckets", async () => {
         const aws4 = new AwsClient({
             accessKeyId: ENV.ACCESS_KEY,
@@ -490,5 +552,240 @@ describe("S3 API Server with Backblaze B2 Backend", () => {
         const response = await worker.fetch(signedReq, ENV, CTX);
         expect(response.status).toBe(403);
         expect(await response.text()).toBe("Access denied to this bucket");
+    });
+
+    // ========================================
+    // Cache API Tests
+    // ========================================
+
+    // 15. Cache MISS → Cache HIT のテスト
+    it("should cache GET requests and serve from cache on second request", async () => {
+        const aws4 = new AwsClient({
+            accessKeyId: ENV.ACCESS_KEY,
+            secretAccessKey: ENV.SECRET_KEY,
+            region: ENV.REGION,
+            service: "s3",
+        });
+
+        const requestUrl = `${endpoint}/test-bucket/cached-file.txt`;
+
+        // 1回目: Cache MISS
+        const signedReq1 = await aws4.sign(requestUrl, {
+            method: "GET",
+            headers: {
+                "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
+            },
+        });
+
+        expect(mockCacheStorage.size()).toBe(0);
+        const response1 = await worker.fetch(signedReq1, ENV, CTX);
+        expect(response1.status).toBe(200);
+        expect(await response1.text()).toBe("Cached content");
+
+        // waitUntil が呼ばれるまで待機
+        await vi.waitFor(() => {
+            expect(CTX.waitUntil).toHaveBeenCalled();
+        });
+
+        // キャッシュに保存されることを確認
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        expect(mockCacheStorage.size()).toBe(1);
+
+        // 2回目: Cache HIT
+        const signedReq2 = await aws4.sign(requestUrl, {
+            method: "GET",
+            headers: {
+                "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
+            },
+        });
+
+        const response2 = await worker.fetch(signedReq2, ENV, CTX);
+        expect(response2.status).toBe(200);
+        expect(await response2.text()).toBe("Cached content");
+    });
+
+    // 16. HEAD リクエストがキャッシュを利用するテスト
+    it("should serve HEAD request from cache if GET was cached", async () => {
+        const aws4 = new AwsClient({
+            accessKeyId: ENV.ACCESS_KEY,
+            secretAccessKey: ENV.SECRET_KEY,
+            region: ENV.REGION,
+            service: "s3",
+        });
+
+        const requestUrl = `${endpoint}/test-bucket/cached-file.txt`;
+
+        // まずGETでキャッシュに保存
+        const getReq = await aws4.sign(requestUrl, {
+            method: "GET",
+            headers: {
+                "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
+            },
+        });
+
+        await worker.fetch(getReq, ENV, CTX);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+
+        // HEADリクエスト（キャッシュから取得）
+        const headReq = await aws4.sign(requestUrl, {
+            method: "HEAD",
+            headers: {
+                "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
+            },
+        });
+
+        const response = await worker.fetch(headReq, ENV, CTX);
+        expect(response.status).toBe(200);
+        expect(response.headers.get("Content-Type")).toBe("text/plain");
+        expect(response.headers.get("Content-Length")).toBe("14");
+    });
+
+    // 17. PUT でキャッシュが無効化されるテスト
+    it("should invalidate cache on PUT", async () => {
+        const aws4 = new AwsClient({
+            accessKeyId: ENV.ACCESS_KEY,
+            secretAccessKey: ENV.SECRET_KEY,
+            region: ENV.REGION,
+            service: "s3",
+        });
+
+        const requestUrl = `${endpoint}/test-bucket/cached-file.txt`;
+
+        // GETでキャッシュ
+        const getReq = await aws4.sign(requestUrl, {
+            method: "GET",
+            headers: {
+                "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
+            },
+        });
+        await worker.fetch(getReq, ENV, CTX);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+
+        expect(mockCacheStorage.size()).toBe(1);
+
+        // PUTでアップロード（キャッシュ無効化）
+        const putReq = await aws4.sign(requestUrl, {
+            method: "PUT",
+            headers: {
+                "Content-Type": "text/plain",
+                "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
+            },
+            body: "Updated content",
+        });
+
+        await worker.fetch(putReq, ENV, CTX);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+
+        // キャッシュが削除されることを確認
+        expect(mockCacheStorage.size()).toBe(0);
+    });
+
+    // 18. DELETE でキャッシュが無効化されるテスト
+    it("should invalidate cache on DELETE", async () => {
+        const aws4 = new AwsClient({
+            accessKeyId: ENV.ACCESS_KEY,
+            secretAccessKey: ENV.SECRET_KEY,
+            region: ENV.REGION,
+            service: "s3",
+        });
+
+        const requestUrl = `${endpoint}/test-bucket/cached-file.txt`;
+
+        // GETでキャッシュ
+        const getReq = await aws4.sign(requestUrl, {
+            method: "GET",
+            headers: {
+                "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
+            },
+        });
+        await worker.fetch(getReq, ENV, CTX);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+
+        expect(mockCacheStorage.size()).toBe(1);
+
+        // DELETEで削除（キャッシュ無効化）
+        const deleteReq = await aws4.sign(requestUrl, {
+            method: "DELETE",
+            headers: {
+                "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
+            },
+        });
+
+        await worker.fetch(deleteReq, ENV, CTX);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+
+        // キャッシュが削除されることを確認
+        expect(mockCacheStorage.size()).toBe(0);
+    });
+
+    // 19. 異なるファイルが個別にキャッシュされるテスト
+    it("should cache different files independently", async () => {
+        const aws4 = new AwsClient({
+            accessKeyId: ENV.ACCESS_KEY,
+            secretAccessKey: ENV.SECRET_KEY,
+            region: ENV.REGION,
+            service: "s3",
+        });
+
+        // ファイル1をGET
+        const req1 = await aws4.sign(`${endpoint}/test-bucket/test-file.txt`, {
+            method: "GET",
+            headers: {
+                "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
+            },
+        });
+        await worker.fetch(req1, ENV, CTX);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+
+        // ファイル2をGET
+        const req2 = await aws4.sign(`${endpoint}/test-bucket/cached-file.txt`, {
+            method: "GET",
+            headers: {
+                "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
+            },
+        });
+        await worker.fetch(req2, ENV, CTX);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+
+        // 2つのファイルが個別にキャッシュされることを確認
+        expect(mockCacheStorage.size()).toBe(2);
+    });
+
+    // 20. 認証パラメータが異なっても同じファイルのキャッシュを利用するテスト
+    it("should use same cache for same file with different auth params", async () => {
+        const aws4 = new AwsClient({
+            accessKeyId: ENV.ACCESS_KEY,
+            secretAccessKey: ENV.SECRET_KEY,
+            region: ENV.REGION,
+            service: "s3",
+        });
+
+        const requestUrl = `${endpoint}/test-bucket/cached-file.txt`;
+
+        // 1回目のリクエスト
+        const req1 = await aws4.sign(requestUrl, {
+            method: "GET",
+            headers: {
+                "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
+            },
+        });
+        await worker.fetch(req1, ENV, CTX);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+
+        expect(mockCacheStorage.size()).toBe(1);
+
+        // 2回目のリクエスト（異なる認証パラメータだがキャッシュヒット）
+        const req2 = await aws4.sign(requestUrl, {
+            method: "GET",
+            headers: {
+                "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
+            },
+        });
+        const response = await worker.fetch(req2, ENV, CTX);
+
+        expect(response.status).toBe(200);
+        expect(await response.text()).toBe("Cached content");
+        // キャッシュは1つのまま
+        expect(mockCacheStorage.size()).toBe(1);
     });
 });
