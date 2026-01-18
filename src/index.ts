@@ -1,7 +1,9 @@
 /**
  * S3-Compatible API Server on Cloudflare Workers
- * Backend: Google Drive with streaming support and nested directory structure
+ * Backend: Backblaze B2 with aws4fetch for S3-compatible access
  */
+
+import { AwsClient } from "aws4fetch";
 
 export default {
     async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -27,66 +29,74 @@ export default {
                 return new Response("Invalid Signature", { status: 403 });
             }
 
-            const accessToken = await getAccessToken(env);
+            // B2クライアントの初期化
+            const b2Client = new AwsClient({
+                accessKeyId: env.B2_KEY_ID,
+                secretAccessKey: env.B2_APPLICATION_KEY,
+                region: env.B2_REGION || "us-west-000",
+                service: "s3",
+            });
+
+            const b2Endpoint = env.B2_ENDPOINT; // 例: s3.us-west-000.backblazeb2.com
 
             if (method === "PUT" || method === "POST") {
-                // ストリーミングアップロード
+                // アップロード
                 if (!objectKey) {
                     return new Response("Object key required", { status: 400 });
                 }
 
                 const contentType = request.headers.get("Content-Type") || "application/octet-stream";
-                const result = await streamUploadToDrive(accessToken, request.body, bucket, objectKey, contentType, env);
+                const result = await uploadToB2(b2Client, b2Endpoint, bucket, objectKey, request.body, contentType);
 
                 return new Response(JSON.stringify(result), {
                     status: 200,
                     headers: {
                         "Content-Type": "application/json",
-                        ETag: `"${result.id}"`, // Google DriveのファイルIDをETagとして使用
+                        ETag: result.etag || "",
                     },
                 });
             } else if (method === "GET") {
-                // ストリーミングダウンロード
+                // ダウンロードまたはリスト
                 if (!objectKey) {
-                    // バケット（フォルダ）の一覧を返す
-                    const files = await listFiles(accessToken, bucket, env);
-                    return new Response(generateListBucketResult(files, bucket), {
+                    // バケット内のオブジェクト一覧
+                    const files = await listB2Objects(b2Client, b2Endpoint, bucket);
+                    return new Response(files, {
                         status: 200,
                         headers: { "Content-Type": "application/xml" },
                     });
                 }
 
                 try {
-                    const fileStream = await streamDownloadFromDrive(accessToken, bucket, objectKey, env);
+                    const fileStream = await downloadFromB2(b2Client, b2Endpoint, bucket, objectKey);
 
                     return new Response(fileStream.body, {
                         status: 200,
                         headers: {
                             "Content-Type": fileStream.contentType,
-                            "Content-Length": fileStream.size.toString(),
+                            "Content-Length": fileStream.contentLength,
                             "Cache-Control": "s-maxage=300, no-store",
-                            ETag: `"${fileStream.id}"`,
+                            ETag: fileStream.etag,
                         },
                     });
                 } catch (e) {
                     const error = e as Error;
-                    if (error.message === "File not found") {
+                    if (error.message.includes("404") || error.message.includes("NoSuchKey")) {
                         return new Response("NoSuchKey", { status: 404 });
                     }
                     throw e;
                 }
             } else if (method === "DELETE") {
-                // ファイル削除
+                // オブジェクト削除
                 if (!objectKey) {
                     return new Response("Object key required", { status: 400 });
                 }
 
                 try {
-                    await deleteFromDrive(accessToken, bucket, objectKey, env);
+                    await deleteFromB2(b2Client, b2Endpoint, bucket, objectKey);
                     return new Response(null, { status: 204 });
                 } catch (e) {
                     const error = e as Error;
-                    if (error.message === "File not found") {
+                    if (error.message.includes("404") || error.message.includes("NoSuchKey")) {
                         return new Response(null, { status: 404 });
                     }
                     throw e;
@@ -98,18 +108,18 @@ export default {
                 }
 
                 try {
-                    const metadata = await getFileMetadata(accessToken, bucket, objectKey, env);
+                    const metadata = await headB2Object(b2Client, b2Endpoint, bucket, objectKey);
                     return new Response(null, {
                         status: 200,
                         headers: {
-                            "Content-Type": metadata.mimeType,
-                            "Content-Length": metadata.size.toString(),
-                            ETag: `"${metadata.id}"`,
+                            "Content-Type": metadata.contentType,
+                            "Content-Length": metadata.contentLength,
+                            ETag: metadata.etag,
                         },
                     });
                 } catch (e) {
                     const error = e as Error;
-                    if (error.message === "File not found") {
+                    if (error.message.includes("404") || error.message.includes("NoSuchKey")) {
                         return new Response(null, { status: 404 });
                     }
                     throw e;
@@ -129,24 +139,11 @@ interface Env {
     ACCESS_KEY: string;
     SECRET_KEY: string;
     REGION: string;
-    GOOGLE_CLIENT_ID: string;
-    GOOGLE_CLIENT_SECRET: string;
-    GOOGLE_REFRESH_TOKEN: string;
-    AUTH_KV: KVNamespace;
-    FOLDER_CACHE: KVNamespace;
+    B2_KEY_ID: string;
+    B2_APPLICATION_KEY: string;
+    B2_ENDPOINT: string;
+    B2_REGION?: string;
     ALLOWED_BUCKETS?: string;
-}
-
-interface GoogleDriveFile {
-    id: string;
-    name: string;
-    mimeType: string;
-    size: string;
-    modifiedTime?: string;
-}
-
-interface GoogleDriveSearchResponse {
-    files?: GoogleDriveFile[];
 }
 
 function isAllowedBucket(bucket: string, env: Env): boolean {
@@ -170,268 +167,96 @@ function isAllowedBucket(bucket: string, env: Env): boolean {
 }
 
 // ========================================
-// Google Drive API Functions
+// Backblaze B2 API Functions (via aws4fetch)
 // ========================================
 
-async function getAccessToken(env: Env): Promise<string> {
-    const cacheKey = "google_access_token";
-
-    const cachedToken = await env.AUTH_KV.get(cacheKey);
-    if (cachedToken) {
-        return cachedToken;
-    }
-
-    const response = await fetch("https://oauth2.googleapis.com/token", {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({
-            client_id: env.GOOGLE_CLIENT_ID,
-            client_secret: env.GOOGLE_CLIENT_SECRET,
-            refresh_token: env.GOOGLE_REFRESH_TOKEN,
-            grant_type: "refresh_token",
-        }),
-    });
-
-    const data: any = await response.json();
-    if (!response.ok) {
-        throw new Error(`Token Error: ${data.error_description}`);
-    }
-
-    await env.AUTH_KV.put(cacheKey, data.access_token, {
-        expirationTtl: data.expires_in - 60,
-    });
-
-    return data.access_token;
-}
-
-async function getOrCreateFolder(accessToken: string, folderName: string, parentId: string | null, env: Env): Promise<string> {
-    // キャッシュキーにparentIdを含める
-    const cacheKey = parentId ? `${parentId}/${folderName}` : folderName;
-    const cached = await env.FOLDER_CACHE.get(cacheKey);
-    if (cached) return cached;
-
-    // フォルダを検索（親フォルダを指定）
-    const parentQuery = parentId ? ` and '${parentId}' in parents` : "";
-    const searchRes = await fetch(`https://www.googleapis.com/drive/v3/files?q=name='${encodeURIComponent(folderName)}' and mimeType='application/vnd.google-apps.folder' and trashed=false${parentQuery}`, {
-        headers: { Authorization: `Bearer ${accessToken}` },
-    });
-
-    const searchData: GoogleDriveSearchResponse = await searchRes.json();
-
-    if (searchData.files && searchData.files.length > 0) {
-        const folderId = searchData.files[0].id;
-        await env.FOLDER_CACHE.put(cacheKey, folderId, { expirationTtl: 3600 });
-        return folderId;
-    }
-
-    // フォルダが存在しない場合は作成
-    const createBody: any = {
-        name: folderName,
-        mimeType: "application/vnd.google-apps.folder",
-    };
-
-    if (parentId) {
-        createBody.parents = [parentId];
-    }
-
-    const createRes = await fetch("https://www.googleapis.com/drive/v3/files", {
-        method: "POST",
-        headers: {
-            Authorization: `Bearer ${accessToken}`,
-            "Content-Type": "application/json",
-        },
-        body: JSON.stringify(createBody),
-    });
-
-    const createData: any = await createRes.json();
-    await env.FOLDER_CACHE.put(cacheKey, createData.id, { expirationTtl: 3600 });
-    return createData.id;
-}
-
-async function resolvePathToFolderAndFile(accessToken: string, bucket: string, objectKey: string, env: Env): Promise<{ parentFolderId: string; fileName: string }> {
-    // バケットのルートフォルダを取得
-    let currentFolderId = await getOrCreateFolder(accessToken, bucket, null, env);
-
-    // objectKeyを/で分割
-    const parts = objectKey.split("/").filter((p) => p);
-
-    if (parts.length === 0) {
-        throw new Error("Invalid object key");
-    }
-
-    const fileName = parts[parts.length - 1];
-    const directories = parts.slice(0, -1);
-
-    for (const dir of directories) {
-        currentFolderId = await getOrCreateFolder(accessToken, dir, currentFolderId, env);
-    }
-
-    return {
-        parentFolderId: currentFolderId,
-        fileName: fileName,
-    };
-}
-
-async function streamUploadToDrive(accessToken: string, stream: ReadableStream | null, bucket: string, objectKey: string, mimeType: string, env: Env): Promise<any> {
-    if (!stream) {
+async function uploadToB2(client: AwsClient, endpoint: string, bucket: string, objectKey: string, body: ReadableStream | null, contentType: string): Promise<{ etag?: string }> {
+    if (!body) {
         throw new Error("Request body is required");
     }
 
-    // パスを解析してフォルダ階層を作成
-    const { parentFolderId, fileName } = await resolvePathToFolderAndFile(accessToken, bucket, objectKey, env);
+    const url = `https://${endpoint}/${bucket}/${objectKey}`;
 
-    // Resumable uploadの初期化
-    const initRes = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable", {
-        method: "POST",
-        headers: {
-            Authorization: `Bearer ${accessToken}`,
-            "X-Upload-Content-Type": mimeType,
-            "Content-Type": "application/json; charset=UTF-8",
-        },
-        body: JSON.stringify({
-            name: fileName,
-            parents: [parentFolderId],
-        }),
-    });
-
-    const uploadUrl = initRes.headers.get("Location");
-    if (!uploadUrl) {
-        console.error(initRes.status);
-        console.error(await initRes.text());
-        throw new Error("Failed to get upload URL");
-    }
-
-    // ストリーミングアップロード
-    const uploadRes = await fetch(uploadUrl, {
+    const response = await client.fetch(url, {
         method: "PUT",
         headers: {
-            Authorization: `Bearer ${accessToken}`,
+            "Content-Type": contentType,
         },
-        body: stream,
+        body: body,
         duplex: "half",
     } as RequestInit);
 
-    if (!uploadRes.ok) {
-        const errorText = await uploadRes.text();
-        throw new Error(`Upload failed: ${errorText}`);
-    }
-
-    return await uploadRes.json();
-}
-
-async function findFileInFolder(accessToken: string, folderId: string, fileName: string): Promise<GoogleDriveFile | null> {
-    const searchRes = await fetch(`https://www.googleapis.com/drive/v3/files?q=name='${encodeURIComponent(fileName)}' and '${folderId}' in parents and trashed=false&fields=files(id,name,mimeType,size)`, {
-        headers: { Authorization: `Bearer ${accessToken}` },
-    });
-
-    const data: GoogleDriveSearchResponse = await searchRes.json();
-    return data.files && data.files.length > 0 ? data.files[0] : null;
-}
-
-async function streamDownloadFromDrive(accessToken: string, bucket: string, objectKey: string, env: Env): Promise<{ body: ReadableStream; contentType: string; size: number; id: string }> {
-    const { parentFolderId, fileName } = await resolvePathToFolderAndFile(accessToken, bucket, objectKey, env);
-    const file = await findFileInFolder(accessToken, parentFolderId, fileName);
-
-    if (!file) {
-        throw new Error("File not found");
-    }
-
-    const controller = new AbortController();
-    const timeout = setTimeout(() => {
-        controller.abort();
-    }, 5000);
-
-    const downloadRes = await fetch(`https://www.googleapis.com/drive/v3/files/${file.id}?alt=media`, {
-        headers: { Authorization: `Bearer ${accessToken}` },
-        signal: controller.signal,
-    });
-
-    clearTimeout(timeout);
-
-    if (!downloadRes.ok) {
-        console.error(downloadRes.status);
-        console.error(await downloadRes.text());
-        throw new Error("Download failed");
+    if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Upload failed: ${response.status} ${errorText}`);
     }
 
     return {
-        body: downloadRes.body!,
-        contentType: file.mimeType || "application/octet-stream",
-        size: parseInt(file.size || "0"),
-        id: file.id,
+        etag: response.headers.get("ETag") || undefined,
     };
 }
 
-async function deleteFromDrive(accessToken: string, bucket: string, objectKey: string, env: Env): Promise<void> {
-    const { parentFolderId, fileName } = await resolvePathToFolderAndFile(accessToken, bucket, objectKey, env);
-    const file = await findFileInFolder(accessToken, parentFolderId, fileName);
+async function downloadFromB2(client: AwsClient, endpoint: string, bucket: string, objectKey: string): Promise<{ body: ReadableStream; contentType: string; contentLength: string; etag: string }> {
+    const url = `https://${endpoint}/${bucket}/${objectKey}`;
 
-    if (!file) {
-        throw new Error("File not found");
+    const response = await client.fetch(url, {
+        method: "GET",
+    });
+
+    if (!response.ok) {
+        throw new Error(`Download failed: ${response.status}`);
     }
 
-    const deleteRes = await fetch(`https://www.googleapis.com/drive/v3/files/${file.id}`, {
+    return {
+        body: response.body!,
+        contentType: response.headers.get("Content-Type") || "application/octet-stream",
+        contentLength: response.headers.get("Content-Length") || "0",
+        etag: response.headers.get("ETag") || '""',
+    };
+}
+
+async function deleteFromB2(client: AwsClient, endpoint: string, bucket: string, objectKey: string): Promise<void> {
+    const url = `https://${endpoint}/${bucket}/${objectKey}`;
+
+    const response = await client.fetch(url, {
         method: "DELETE",
-        headers: { Authorization: `Bearer ${accessToken}` },
     });
 
-    if (!deleteRes.ok) {
-        throw new Error("Delete failed");
+    if (!response.ok) {
+        throw new Error(`Delete failed: ${response.status}`);
     }
 }
 
-async function getFileMetadata(accessToken: string, bucket: string, objectKey: string, env: Env): Promise<{ id: string; mimeType: string; size: number }> {
-    const { parentFolderId, fileName } = await resolvePathToFolderAndFile(accessToken, bucket, objectKey, env);
-    const file = await findFileInFolder(accessToken, parentFolderId, fileName);
+async function headB2Object(client: AwsClient, endpoint: string, bucket: string, objectKey: string): Promise<{ contentType: string; contentLength: string; etag: string }> {
+    const url = `https://${endpoint}/${bucket}/${objectKey}`;
 
-    if (!file) {
-        throw new Error("File not found");
+    const response = await client.fetch(url, {
+        method: "HEAD",
+    });
+
+    if (!response.ok) {
+        throw new Error(`HEAD failed: ${response.status}`);
     }
 
     return {
-        id: file.id,
-        mimeType: file.mimeType || "application/octet-stream",
-        size: parseInt(file.size || "0"),
+        contentType: response.headers.get("Content-Type") || "application/octet-stream",
+        contentLength: response.headers.get("Content-Length") || "0",
+        etag: response.headers.get("ETag") || '""',
     };
 }
 
-async function listFiles(accessToken: string, bucket: string, env: Env): Promise<GoogleDriveFile[]> {
-    const folderId = await getOrCreateFolder(accessToken, bucket, null, env);
+async function listB2Objects(client: AwsClient, endpoint: string, bucket: string): Promise<string> {
+    const url = `https://${endpoint}/${bucket}`;
 
-    const listRes = await fetch(`https://www.googleapis.com/drive/v3/files?q='${folderId}' in parents and trashed=false&fields=files(id,name,mimeType,size,modifiedTime)`, {
-        headers: { Authorization: `Bearer ${accessToken}` },
+    const response = await client.fetch(url, {
+        method: "GET",
     });
 
-    const data: GoogleDriveSearchResponse = await listRes.json();
-    return data.files || [];
-}
+    if (!response.ok) {
+        throw new Error(`List failed: ${response.status}`);
+    }
 
-function generateListBucketResult(files: any[], bucket: string): string {
-    const contents = files
-        .map(
-            (f) => `
-    <Contents>
-        <Key>${escapeXml(f.name)}</Key>
-        <LastModified>${f.modifiedTime || new Date().toISOString()}</LastModified>
-        <ETag>"${f.id}"</ETag>
-        <Size>${f.size || 0}</Size>
-        <StorageClass>STANDARD</StorageClass>
-    </Contents>`,
-        )
-        .join("");
-
-    return `<?xml version="1.0" encoding="UTF-8"?>
-<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-    <Name>${escapeXml(bucket)}</Name>
-    <Prefix></Prefix>
-    <MaxKeys>1000</MaxKeys>
-    <IsTruncated>false</IsTruncated>
-    ${contents}
-</ListBucketResult>`;
-}
-
-function escapeXml(str: string): string {
-    return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+    return await response.text();
 }
 
 // ========================================

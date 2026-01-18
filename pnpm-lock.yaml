@@ -7,6 +7,10 @@ settings:
 importers:
 
   .:
+    dependencies:
+      aws4fetch:
+        specifier: ^1.0.20
+        version: 1.0.20
     devDependencies:
       '@aws-sdk/client-s3':
         specifier: ^3.965.0
@@ -20,9 +24,6 @@ importers:
       '@cloudflare/vitest-pool-workers':
         specifier: ^0.12.1
         version: 0.12.1(@vitest/runner@4.0.17)(@vitest/snapshot@4.0.17)(vitest@4.0.17)
-      aws4fetch:
-        specifier: ^1.0.20
-        version: 1.0.20
       typescript:
         specifier: ^5.5.2
         version: 5.9.3
