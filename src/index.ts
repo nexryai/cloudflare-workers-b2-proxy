@@ -1,7 +1,7 @@
 /**
  * S3-Compatible API Server on Cloudflare Workers with Cache API
  * Backend: Backblaze B2 with aws4fetch for S3-compatible access
- * Cache: Cloudflare Cache API for GET requests (streaming maintained)
+ * Cache: Cloudflare Cache API for GET requests
  */
 
 import { AwsClient } from "aws4fetch";
@@ -71,10 +71,8 @@ export default {
                     });
                 }
 
-                // オブジェクトのダウンロード（キャッシュあり）
                 return await handleCachedGet(request, b2Client, b2Endpoint, bucket, objectKey, ctx);
             } else if (method === "DELETE") {
-                // オブジェクト削除
                 if (!objectKey) {
                     return new Response("Object key required", { status: 400 });
                 }
@@ -95,7 +93,6 @@ export default {
                     throw e;
                 }
             } else if (method === "HEAD") {
-                // メタデータ取得（キャッシュあり）
                 if (!objectKey) {
                     return new Response(null, { status: 400 });
                 }
@@ -163,7 +160,6 @@ async function handleCachedGet(request: Request, client: AwsClient, endpoint: st
     let response = await cache.match(cacheKey);
 
     if (response) {
-        // キャッシュヒット
         console.log("Cache HIT:", cacheKey);
         return new Response(response.body, {
             status: response.status,
@@ -171,12 +167,10 @@ async function handleCachedGet(request: Request, client: AwsClient, endpoint: st
         });
     }
 
-    // キャッシュミス: B2から取得
     console.log("Cache MISS:", cacheKey);
     try {
         const fileStream = await downloadFromB2(client, endpoint, bucket, objectKey);
 
-        // レスポンスを作成（ストリーミングを維持）
         response = new Response(fileStream.body, {
             status: 200,
             headers: {
@@ -187,7 +181,7 @@ async function handleCachedGet(request: Request, client: AwsClient, endpoint: st
             },
         });
 
-        // 非同期でキャッシュに保存（ストリーミングレスポンスをブロックしない）
+        // 非同期でキャッシュに保存
         ctx.waitUntil(cache.put(cacheKey, response.clone()));
 
         return response;
@@ -209,7 +203,6 @@ async function handleCachedHead(request: Request, client: AwsClient, endpoint: s
     const cachedResponse = await cache.match(cacheKey);
 
     if (cachedResponse) {
-        // キャッシュヒット: ヘッダーのみ返す
         console.log("Cache HIT (HEAD):", cacheKey);
         return new Response(null, {
             status: 200,
@@ -221,7 +214,6 @@ async function handleCachedHead(request: Request, client: AwsClient, endpoint: s
         });
     }
 
-    // キャッシュミス: B2から取得
     console.log("Cache MISS (HEAD):", cacheKey);
     try {
         const metadata = await headB2Object(client, endpoint, bucket, objectKey);
